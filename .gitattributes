@@ -1,0 +1,10 @@
+# Repo được phát triển trên Windows nhưng chạy trong container Linux.
+# Nếu script .sh bị checkout với CRLF, bash trong container sẽ báo
+# "\r: command not found" và init thất bại. Ép LF cho mọi file chạy trong
+# container. (Dockerfile còn có một lớp phòng thủ nữa: sed -i 's/\r$//')
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.sql     text eol=lf
+*.conf    text eol=lf
+Dockerfile text eol=lf

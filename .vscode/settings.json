@@ -1,0 +1,21 @@
+{
+  // Repo này không có code Python. Extension "Python Environments" mặc định
+  // coi ${workspaceFolder}/.env là environment file của Python, nên nó hiện
+  // thông báo gợi ý bật "python.terminal.useEnvFile".
+  //
+  // Ở đây .env chứa MẬT KHẨU DATABASE, không phải biến cấu hình của Python.
+  // Vì vậy ngắt hẳn liên kết thay vì bật lên: vừa hết thông báo, vừa tránh
+  // việc extension nạp mật khẩu vào tiến trình khi chạy/debug một file .py
+  // bất kỳ trong workspace.
+  //
+  // Dự án Python thật thì làm ngược lại: để nguyên python.envFile và đặt
+  // python.terminal.useEnvFile = true.
+  "python.envFile": "",
+  "python.terminal.useEnvFile": false,
+
+  // .env dùng cú pháp KEY=VALUE, không phải shell script -> tránh VS Code
+  // tô màu và gợi ý sai.
+  "files.associations": {
+    ".env.example": "properties"
+  }
+}

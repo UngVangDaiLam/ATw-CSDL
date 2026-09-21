@@ -1,0 +1,41 @@
+# --- Bí mật -------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+
+# --- Dữ liệu vận hành: không commit, chỉ giữ cấu trúc thư mục -----------
+logs/*
+!logs/.gitkeep
+
+backup/full/*
+!backup/full/.gitkeep
+
+backup/wal_archive/*
+!backup/wal_archive/.gitkeep
+
+# --- Node (app / analyzer / dashboard ở các bước sau) -------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+dist/
+build/
+coverage/
+
+# --- Claude Code ---------------------------------------------------------
+# CLAUDE.md thì COMMIT (hướng dẫn chung cho cả nhóm).
+# settings.local.json là cấu hình riêng từng máy -> không chia sẻ.
+.claude/settings.local.json
+
+# --- IDE / OS -----------------------------------------------------------
+# Chia sẻ settings.json cho cả nhóm (nó tắt việc Python extension đọc .env),
+# nhưng không chia sẻ launch.json / tasks.json / file cá nhân khác.
+.vscode/*
+!.vscode/settings.json
+
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

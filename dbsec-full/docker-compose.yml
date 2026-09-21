@@ -1,0 +1,62 @@
+services:
+  postgres:
+    build:
+      context: ./db
+      dockerfile: Dockerfile
+    image: dbsec-postgres-pgaudit:16
+    container_name: dbsec_postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Mọi file .sql trong đây tự chạy 1 lần duy nhất, lúc khởi tạo database lần đầu
+      # (nếu đã có dữ liệu trong volume pgdata, sửa file ở đây sẽ KHÔNG tự chạy lại).
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      # Nơi chứa WAL archive cho Point-in-Time Recovery (sẽ dùng ở Tuần 7).
+      - wal_archive:/var/lib/postgresql/wal_archive
+    command:
+      - postgres
+      # pgAudit phải được nạp qua shared_preload_libraries (không thể bật bằng ALTER SYSTEM
+      # sau khi server đã chạy) nên ta truyền thẳng qua tham số khởi động ở đây.
+      - -c
+      - shared_preload_libraries=pgaudit
+      - -c
+      - pgaudit.log=write,ddl,role
+      - -c
+      - pgaudit.log_relation=on
+      - -c
+      - pgaudit.log_parameter=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: dbsec_pgadmin
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pgdata:
+  pgadmin_data:
+  wal_archive:

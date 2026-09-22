@@ -28,6 +28,7 @@ services:
       APP_USER_PASSWORD: ${APP_USER_PASSWORD}
       READONLY_PASSWORD: ${READONLY_PASSWORD}
       ADMIN_PASSWORD:    ${ADMIN_PASSWORD}
+      ANALYZER_PASSWORD: ${ANALYZER_PASSWORD}
 
     # LỚP 2 - khóa mã hóa.
     # Mount thành file ở /run/secrets/ bên trong container, KHÔNG thành biến

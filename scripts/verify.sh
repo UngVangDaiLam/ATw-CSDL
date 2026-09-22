@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 [ -f .env ] || { echo "Khong tim thay .env - copy tu .env.example truoc."; exit 1; }
 set -a; . ./.env; set +a
+: "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chua co trong .env - them vao (xem .env.example)}"
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
 PASS=0; FAIL=0
@@ -27,6 +28,8 @@ sql_app() { docker compose exec -T postgres psql "$APP_URL" -tAc "$1" 2>&1; }
 # thì không, nên dòng ERROR thường xuất hiện TRƯỚC dòng "SET" - lấy tail -1 sẽ
 # ra "SET" và làm mọi phép thử lỗi đều trượt một cách khó hiểu.
 sql_nv() { docker compose exec -T postgres psql "$APP_URL" -tAc "SET ROLE $1; $2" 2>&1 | grep -vx 'SET'; }
+# psql dưới quyền analyzer_user (TCP) - role của lớp 3, chỉ INSERT audit.alerts
+sql_an() { docker compose exec -T postgres psql "postgresql://analyzer_user:${ANALYZER_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mDAT  \033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mTRUOT\033[0m %s\n' "$1"; printf '        mong doi: %s\n        nhan duoc: %s\n' "$2" "$3"; }
@@ -129,13 +132,55 @@ expect "tham so KHONG bi ghi plaintext (pgaudit.log_parameter=off)" "<not logged
        "$(grep -h AUDIT logs/*.csv 2>/dev/null | grep -F "$MARK" | tail -1)"
 
 # -----------------------------------------------------------------------------
+section "LOP 3b - analyzer_user: chi duoc GHI canh bao, khong duoc doc"
+expect "analyzer_user ket noi duoc qua TCP (co dong rieng trong pg_hba)" "analyzer_user" \
+       "$(sql_an 'SELECT current_user;')"
+# Ghi thật rồi ROLLBACK: chứng minh quyền INSERT có hiệu lực mà không để lại rác.
+expect "analyzer_user INSERT duoc vao audit.alerts" "ghi_duoc" \
+       "$(sql_an "BEGIN; INSERT INTO audit.alerts(db_user,rule_triggered,risk_score,detail) VALUES ('nv_hn01','VERIFY_PROBE',50,'{}'::jsonb) RETURNING 'ghi_duoc'; ROLLBACK;")"
+expect "analyzer_user KHONG doc duoc audit.alerts (ghi mot chieu)" "permission denied for table alerts" \
+       "$(sql_an 'SELECT * FROM audit.alerts;')"
+expect "analyzer_user KHONG xoa duoc bang chung" "permission denied for table alerts" \
+       "$(sql_an 'DELETE FROM audit.alerts;')"
+expect "analyzer_user KHONG sua duoc bang chung" "permission denied for table alerts" \
+       "$(sql_an 'UPDATE audit.alerts SET risk_score = 0;')"
+expect "analyzer_user KHONG cham duoc du lieu nghiep vu" "permission denied for schema app" \
+       "$(sql_an 'SELECT count(*) FROM app.customers;')"
+
+# -----------------------------------------------------------------------------
+section "DU LIEU - khoi luong theo yeu cau de bai"
+N_CUST=$(sql_su 'SELECT count(*) FROM app.customers;')
+N_ORD=$(sql_su  'SELECT count(*) FROM app.orders;')
+N_PAY=$(sql_su  'SELECT count(*) FROM app.payments;')
+if [ "${N_CUST:-0}" -ge 5000 ] 2>/dev/null; then ok "app.customers co $N_CUST dong (de bai yeu cau >= 5000)"
+else bad "app.customers >= 5000 dong" ">= 5000" "${N_CUST:-loi}"; fi
+if [ "${N_ORD:-0}" -ge 5000 ] 2>/dev/null; then ok "app.orders co $N_ORD dong"
+else bad "app.orders >= 5000 dong" ">= 5000" "${N_ORD:-loi}"; fi
+if [ "${N_PAY:-0}" -gt 0 ] 2>/dev/null; then ok "app.payments co $N_PAY dong"
+else bad "app.payments co du lieu" "> 0" "${N_PAY:-loi}"; fi
+# Dữ liệu phải trải đều cả ba chi nhánh, nếu không thì phép thử RLS ở trên chỉ
+# đang chứng minh "chi nhánh kia rỗng" chứ không chứng minh được nó bị lọc.
+expect "ca 3 chi nhanh deu co khach hang" "3" \
+       "$(sql_su 'SELECT count(DISTINCT branch_id) FROM app.customers;')"
+expect "khong co don hang nao lech chi nhanh so voi khach hang" "0" \
+       "$(sql_su 'SELECT count(*) FROM app.orders o JOIN app.customers c ON c.id = o.customer_id WHERE o.branch_id <> c.branch_id;')"
+
+# -----------------------------------------------------------------------------
 section "LOP 4 - WAL archiving"
-BEFORE=$(ls -1 backup/wal_archive/ 2>/dev/null | grep -vc gitkeep)
-sql_su 'SELECT pg_switch_wal();' >/dev/null
-sleep 4
-AFTER=$(ls -1 backup/wal_archive/ 2>/dev/null | grep -vc gitkeep)
-if [ "$AFTER" -gt "$BEFORE" ]; then ok "pg_switch_wal() sinh them file WAL ($BEFORE -> $AFTER)"
-else bad "pg_switch_wal() sinh them file WAL" "so file tang" "$BEFORE -> $AFTER"; fi
+# pg_switch_wal() KHÔNG làm gì nếu segment hiện tại chưa có bản ghi nào kể từ
+# lần switch trước - khi đó không file nào được sinh ra và phép thử kiểu "đếm
+# thấy số file tăng" sẽ trượt dù archiving hoàn toàn bình thường (chính các
+# phép thử phía trên đã vô tình switch sang segment mới).
+# Nên: ghi một bản ghi WAL trước (pg_logical_emit_message không đụng bảng nào),
+# switch, rồi chờ ĐÚNG tên segment vừa đóng xuất hiện trong kho lưu trữ.
+WALFILE=$(sql_su "SELECT pg_logical_emit_message(true,'verify','wal-probe'); SELECT pg_walfile_name(pg_switch_wal());" | tail -1)
+ARCHIVED=""
+for _ in $(seq 1 15); do
+    [ -f "backup/wal_archive/$WALFILE" ] && { ARCHIVED="yes"; break; }
+    sleep 1
+done
+if [ -n "$ARCHIVED" ]; then ok "segment $WALFILE da duoc archive sang backup/wal_archive/"
+else bad "segment WAL vua dong duoc archive" "co file $WALFILE" "khong thay sau 15s"; fi
 expect "khong co lan archive nao that bai" "0" "$(sql_su 'SELECT failed_count FROM pg_stat_archiver;')"
 
 # -----------------------------------------------------------------------------

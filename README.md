@@ -159,6 +159,7 @@ chỉ với các role nghiệp vụ.
 | `nv_hn01` `nv_dn01` `nv_hcm01` | **không** (`NOLOGIN`) | nhân viên từng chi nhánh. Chỉ vào được bằng `SET ROLE` từ `app_user` |
 | `readonly_user` | có | `SELECT` trên `customers`, `orders` của chi nhánh mình. Bị ép `default_transaction_read_only = on` |
 | `admin_user` | có | không có quyền trực tiếp trên bảng; `SET ROLE db_owner` để làm DDL |
+| `analyzer_user` | có | **chỉ `INSERT` trên `audit.alerts`** — không đọc, không sửa, không xóa; không chạm được schema `app` |
 
 Ba cơ chế xếp chồng khiến `app_user` không thể DROP bảng:
 
@@ -293,15 +294,17 @@ transaction, và cần thêm cột `key_version` để hỗ trợ giai đoạn h
 bash scripts/verify.sh
 ```
 
-Chạy 30 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 43 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
 role nghiệp vụ không chạm được khóa, `readonly_user` không đọc được cột `cccd`,
 **`pg_dump` không chứa CCCD hay số thẻ ở dạng rõ**, khóa không rò vào log,
-pgAudit ghi được câu lệnh và cả `SET ROLE`, WAL archive không có lần nào thất bại.
+pgAudit ghi được câu lệnh và cả `SET ROLE`, `analyzer_user` ghi được cảnh báo
+nhưng không đọc/sửa/xóa được, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
+ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`.
 
-Kết quả mong đợi: `DAT: 30    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 43    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -384,6 +387,6 @@ cd app && npm install && cp .env.example .env && npm run dev
 
 ## 8. Bước tiếp theo
 
-- **`analyzer/`** — đọc `logs/*.json`, bám `pid` để quy trách nhiệm theo `SET ROLE`, sinh cảnh báo vào `audit.alerts`. Cần một role riêng chỉ có `INSERT` trên bảng đó.
+- **`analyzer/`** — đọc `logs/*.json`, bám `pid` để quy trách nhiệm theo `SET ROLE`, sinh cảnh báo vào `audit.alerts`. Role `analyzer_user` đã sẵn sàng (chỉ `INSERT`, xem bảng phân quyền ở mục 4); phần còn thiếu là code.
 - **`dashboard/`** — React + Socket.IO hiển thị `audit.alerts` realtime.
 - **`backup/scripts/`** — `pg_basebackup` làm mốc PITR, `pg_dump` định kỳ, kịch bản khôi phục bằng `recovery_target_time`.

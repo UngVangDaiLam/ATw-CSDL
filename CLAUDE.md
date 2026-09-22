@@ -14,10 +14,10 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | pgAudit xong; **`analyzer/` chưa có code** |
+| 3 | `pgAudit` + analyzer tự viết | pgAudit xong; role `analyzer_user` đã có; **`analyzer/` chưa có code** |
 | 4 | WAL archive + `pg_dump` + PITR | Archiving xong; **`backup/scripts/` rỗng** |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (30 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (43 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -117,6 +117,20 @@ Repo phát triển trên Windows, chạy trong container Linux. CRLF làm bash b
 `\r: command not found` và init thất bại. Đã chặn hai lớp (`.gitattributes` và
 `sed -i 's/\r$//'` trong Dockerfile) — đừng gỡ lớp nào.
 
+**7. Container báo `healthy` KHÔNG có nghĩa là init đã chạy xong.**
+Healthcheck trong `docker-compose.yml` gọi `pg_isready` qua **unix socket**, mà
+trong lúc chạy `/docker-entrypoint-initdb.d/` thì entrypoint đã dựng sẵn một
+*temp server* nghe trên đúng socket đó. Nên container chuyển sang `healthy`
+khi `07_seed.sql` mới mã hóa được một nửa số dòng. Chạy `verify.sh` ngay lúc
+ấy sẽ thấy bảng thiếu dòng hoặc role chưa tồn tại — trượt mà không hiểu vì sao.
+
+Temp server chạy với `listen_addresses=''` nên **không nghe TCP**. Đó là cách
+phân biệt chắc chắn, và cũng là thứ `scripts/reset.sh` đang dùng để chờ:
+
+```bash
+docker compose exec -T postgres pg_isready -h 172.28.0.10 -p 5432 -q
+```
+
 ## Quy ước phải giữ
 
 **Thêm bảng mới → phải thêm `GRANT` tường minh vào `04_grants.sql`.**
@@ -130,10 +144,29 @@ tạo dưới quyền `postgres`, bảng sẽ thuộc superuser và mô hình t�
 bị phá. `app_user` không thể `DROP`/`ALTER` chính vì nó không phải owner — chỉ
 `REVOKE` thôi là không đủ.
 
+**`07_seed.sql` chia hai phần, đừng trộn vào nhau.** PHẦN A là vài dòng viết
+tay với giá trị cố định — `scripts/verify.sh` ghim cứng chúng (CCCD
+`001201000001`, tên `Khach Hang 02`, thẻ `4242424242424242`) nên sửa PHẦN A là
+phải sửa `verify.sh` theo. PHẦN B sinh hàng loạt bằng `generate_series`, khối
+lượng đặt ở ba biến `\set` đầu file (mặc định 6000 khách / 10000 đơn / 4000
+thanh toán — đề bài yêu cầu 5.000–10.000).
+
+Sinh dữ liệu **trong database**, không bằng Faker.js ở tầng ứng dụng: `cccd`
+phải đi qua `app.encrypt_text()` + `app.blind_index()`, mà hai hàm đó lấy khóa
+từ `ext.master_key()` — thứ chỉ database đọc được. CCCD sinh ra luôn có chữ số
+thứ 5 là `9` để không đụng PHẦN A (`cccd_hash` có ràng buộc UNIQUE).
+`SELECT setseed(0.4242)` ở đầu file giữ cho hai lần `reset.sh` ra cùng một tập
+dữ liệu, nhờ vậy số đo hiệu năng giữa các lần chạy mới so sánh được.
+
 **Schema:**
 - `app` — bảng nghiệp vụ (`branches`, `staff`, `customers`, `orders`, `payments`)
 - `audit` — `alerts`. **Không cấp quyền gì cho `app_user`**: nếu `app_user` bị
-  chiếm, kẻ tấn công không được đọc hay xóa bằng chứng phát hiện.
+  chiếm, kẻ tấn công không được đọc hay xóa bằng chứng phát hiện. Ngoài
+  `db_owner` thì chỉ `analyzer_user` chạm tới được, và **chỉ bằng `INSERT`** —
+  không `SELECT`, không `UPDATE`/`DELETE`. Bảng là append-only: analyzer ghi
+  được nhưng không đọc ngược hay xóa được thứ nó đã ghi. Đừng cấp thêm
+  `SELECT` cho nó "để tiện lọc trùng" — analyzer tự nhớ vị trí đã đọc bằng
+  offset file bên ngoài. Vai trò đọc `alerts` cho dashboard sẽ là role khác.
 - `ext` — `pgcrypto`. Để riêng vì `PUBLIC` có `USAGE` mặc định trên `public`;
   đặt pgcrypto ở đó thì mọi role đều gọi được `pgp_sym_decrypt()`. Gọi hàm phải
   qualify `ext.` (hoặc dựa vào `search_path` đã set sẵn cho `app_user`).
@@ -277,7 +310,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 21 phép thử, phải đạt hết
+bash scripts/verify.sh         # 43 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

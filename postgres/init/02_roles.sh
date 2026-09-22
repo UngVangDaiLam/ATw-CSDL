@@ -18,6 +18,7 @@ set -Eeuo pipefail
 : "${APP_USER_PASSWORD:?APP_USER_PASSWORD chưa được set trong .env}"
 : "${READONLY_PASSWORD:?READONLY_PASSWORD chưa được set trong .env}"
 : "${ADMIN_PASSWORD:?ADMIN_PASSWORD chưa được set trong .env}"
+: "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chưa được set trong .env}"
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" \
@@ -26,7 +27,8 @@ psql -v ON_ERROR_STOP=1 \
      -v owner_pw="$DB_OWNER_PASSWORD" \
      -v app_pw="$APP_USER_PASSWORD" \
      -v ro_pw="$READONLY_PASSWORD" \
-     -v admin_pw="$ADMIN_PASSWORD" <<-'EOSQL'
+     -v admin_pw="$ADMIN_PASSWORD" \
+     -v analyzer_pw="$ANALYZER_PASSWORD" <<-'EOSQL'
 
     -- =========================================================================
     -- ROLE SỞ HỮU
@@ -69,6 +71,29 @@ psql -v ON_ERROR_STOP=1 \
         CONNECTION LIMIT 5;
 
     GRANT db_owner TO admin_user;
+
+    -- =========================================================================
+    -- ROLE PHÂN TÍCH LOG - LỚP 3
+    --
+    -- Danh tính riêng cho analyzer/, KHÔNG dùng lại app_user. Lý do: bộ phân
+    -- tích đọc log ở ngoài database rồi ghi cảnh báo vào audit.alerts, nên nó
+    -- không có nhu cầu chạm vào một bảng nghiệp vụ nào. Cho nó dùng app_user
+    -- là tự tay nới quyền của tiến trình phân tích lên bằng quyền của cả ứng
+    -- dụng - hỏng đúng nguyên tắc đặc quyền tối thiểu mà lớp 1 đang chứng minh.
+    --
+    -- Quyền của role này hẹp tới mức CHỈ CÓ INSERT trên đúng một bảng
+    -- (xem 04_grants.sql). Không SELECT, không UPDATE, không DELETE:
+    --   - Không SELECT -> chiếm được analyzer_user cũng không đọc được mình đã
+    --     bị phát hiện những gì. Analyzer tự nhớ vị trí đã đọc bằng offset file
+    --     phía ngoài, không cần truy vấn ngược lại bảng.
+    --   - Không UPDATE/DELETE -> bảng cảnh báo là APPEND-ONLY. Bằng chứng đã
+    --     ghi thì không sửa hay xóa được, kể cả bởi chính tiến trình đã ghi nó.
+    -- Vai trò ĐỌC alerts (cho dashboard ở bước 4) sẽ là một role khác nữa.
+    -- =========================================================================
+    CREATE ROLE analyzer_user
+        LOGIN PASSWORD :'analyzer_pw'
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+        CONNECTION LIMIT 5;
 
     -- =========================================================================
     -- ROLE NHÂN VIÊN - trục định danh cho Row-Level Security
@@ -119,7 +144,7 @@ psql -v ON_ERROR_STOP=1 \
     -- đích danh: role lạ (hoặc role tạo nhầm) sẽ không connect được.
     -- =========================================================================
     REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user;
+    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user, analyzer_user;
 
     -- =========================================================================
     -- THAM SỐ MẶC ĐỊNH THEO ROLE
@@ -142,6 +167,11 @@ psql -v ON_ERROR_STOP=1 \
     ALTER ROLE db_owner      SET search_path = app, audit, ext;
     ALTER ROLE admin_user    SET search_path = app, audit, ext;
 
+    -- search_path CHỈ có audit: analyzer không có việc gì với schema app.
+    ALTER ROLE analyzer_user SET search_path = audit;
+    ALTER ROLE analyzer_user SET statement_timeout = '15s';
+    ALTER ROLE analyzer_user SET application_name = 'secdb-analyzer';
+
 EOSQL
 
-echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user"
+echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user / analyzer_user"

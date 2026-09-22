@@ -45,4 +45,25 @@ bash scripts/init-secrets.sh
 echo "==> Build va khoi dong lai"
 docker compose up -d --build
 
+# Chờ init chạy xong thay vì trả quyền điều khiển ngay. 07_seed.sql mã hóa vài
+# nghìn dòng nên khởi tạo mất vài chục giây; chạy verify.sh trong lúc đó sẽ
+# thấy bảng còn rỗng hoặc role chưa kịp tạo, và trượt một cách khó hiểu.
+#
+# PHẢI dò qua TCP, KHÔNG dùng trạng thái `healthy` của container: healthcheck
+# trong docker-compose.yml gọi pg_isready qua unix socket, mà trong lúc chạy
+# /docker-entrypoint-initdb.d/ thì entrypoint đã dựng sẵn một TEMP SERVER nghe
+# trên chính socket đó. Kết quả là container báo "healthy" khi init mới chạy
+# được một nửa. Temp server chạy với listen_addresses='' nên không nghe TCP -
+# dò qua 172.28.0.10 mới phân biệt được server thật với temp server.
+echo "==> Cho database khoi tao xong (co the mat 1-2 phut)"
+READY=""
+for _ in $(seq 1 90); do
+    if docker compose exec -T postgres pg_isready -h 172.28.0.10 -p 5432 -q 2>/dev/null; then
+        READY="yes"; break
+    fi
+    sleep 2
+done
+[ -n "$READY" ] && echo "==> Database da san sang." \
+                || echo "==> CANH BAO: het thoi gian cho. Xem 'docker compose logs postgres'."
+
 echo "==> Xong. Chay 'bash scripts/verify.sh' de nghiem thu."

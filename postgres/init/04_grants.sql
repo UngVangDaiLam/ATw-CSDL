@@ -28,7 +28,8 @@ GRANT USAGE ON SCHEMA app TO app_user, readonly_user;
 -- 05_crypto.sql - chúng là SECURITY DEFINER nên tự chạy dưới quyền db_owner.
 -- Nhờ vậy mỗi lần giải mã là một lời gọi hàm có tên rõ ràng trong log pgAudit.
 --
--- audit: không cấp cho ai ngoài db_owner. Role cho analyzer sẽ thêm ở bước 3.
+-- audit: ngoài db_owner thì CHỈ analyzer_user chạm tới được, và chỉ bằng INSERT
+-- (xem khối analyzer_user bên dưới).
 
 -- =============================================================================
 -- app_user
@@ -96,6 +97,29 @@ GRANT SELECT (id, branch_id, full_name, phone, email, created_at, updated_at)
     ON app.customers TO readonly_user;
 
 GRANT SELECT ON app.orders TO readonly_user;
+
+-- =============================================================================
+-- analyzer_user  (LỚP 3)
+--
+-- Quyền hẹp nhất trong toàn bộ lab: đúng MỘT động từ trên ĐÚNG MỘT bảng.
+--
+-- KHÔNG có USAGE trên schema `app` -> không đọc được customers/orders/payments.
+-- Bộ phân tích làm việc với file log ở ngoài database, nó không có lý do gì để
+-- truy vấn dữ liệu nghiệp vụ; nếu tiến trình analyzer bị chiếm thì kẻ tấn công
+-- cũng không mượn được nó để đọc dữ liệu khách hàng.
+--
+-- KHÔNG có SELECT trên chính audit.alerts -> không đọc ngược được lịch sử cảnh
+-- báo. Đây là chủ đích: ghi được nhưng không đọc được.
+-- KHÔNG có UPDATE/DELETE/TRUNCATE -> bảng cảnh báo APPEND-ONLY, bằng chứng đã
+-- ghi thì không ai sửa hay xóa được, kể cả tiến trình đã tạo ra nó.
+-- =============================================================================
+GRANT USAGE  ON SCHEMA audit       TO analyzer_user;
+GRANT INSERT ON audit.alerts       TO analyzer_user;
+
+-- INSERT vào cột BIGSERIAL cần nextval trên sequence tương ứng.
+-- Sequence của schema `audit` KHÔNG nằm trong ALTER DEFAULT PRIVILEGES ở cuối
+-- file (khối đó chỉ áp cho schema `app`), nên phải cấp tường minh ở đây.
+GRANT USAGE  ON SEQUENCE audit.alerts_id_seq TO analyzer_user;
 
 -- =============================================================================
 -- admin_user

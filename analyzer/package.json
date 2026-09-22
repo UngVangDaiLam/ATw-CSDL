@@ -1,0 +1,15 @@
+{
+  "name": "secdb-analyzer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LOP 3 - doc log pgAudit (ban .json), bam theo phien de quy trach nhiem cho tung nhan vien qua SET ROLE, phat hien hanh vi bat thuong va ghi canh bao vao audit.alerts bang role analyzer_user (chi co INSERT).",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dry": "node src/index.js --dry-run --all"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.12.0"
+  }
+}

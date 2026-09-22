@@ -14,19 +14,19 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | pgAudit xong; role `analyzer_user` đã có; **`analyzer/` chưa có code** |
+| 3 | `pgAudit` + analyzer tự viết | **Xong** (6 rule, ghi `audit.alerts` bằng `analyzer_user`) |
 | 4 | WAL archive + `pg_dump` + PITR | Archiving xong; **`backup/scripts/` rỗng** |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (43 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (49 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
 `05_crypto` → `06_rls` → `07_seed`.
 
 Stack dự kiến: PostgreSQL 16 · Node.js + Express (`app/`) · Node.js
-(`analyzer/`) · React + Socket.IO (`dashboard/`). `app/` đã có code (xem mục
-"app/ — quy ước" bên dưới và `app/README.md`); `analyzer/` và `dashboard/`
-hiện chỉ có README giữ chỗ.
+(`analyzer/`) · React + Socket.IO (`dashboard/`). `app/` và `analyzer/` đã có
+code (xem `app/README.md`, `analyzer/README.md` và hai mục quy ước bên dưới);
+`dashboard/` hiện chỉ có README giữ chỗ.
 
 ## Lệnh thường dùng
 
@@ -279,10 +279,16 @@ thuộc vào điều này.
 
 **Cột `user` trong log LUÔN là `app_user`, không bao giờ là `nv_xxx`.** Đó là
 *session user* (role đã xác thực), `SET ROLE` không đổi được nó. Muốn quy trách
-nhiệm theo từng nhân viên, analyzer phải **bám theo `pid` của phiên**: gặp dòng
+nhiệm theo từng nhân viên, analyzer phải **bám theo từng phiên**: gặp dòng
 `AUDIT: ...,MISC,SET,,,SET ROLE nv_dn01;` thì mọi câu lệnh sau đó trong cùng
-`pid` được quy cho `nv_dn01`, cho tới dòng `SET ROLE` kế tiếp hoặc
+phiên được quy cho `nv_dn01`, cho tới dòng `SET ROLE` kế tiếp hoặc
 `disconnection`.
+
+Khóa để gom phiên là **`session_id`, không phải `pid`**. Hệ điều hành cấp phát
+lại pid sau khi backend kết thúc, nên hai phiên cách nhau vài phút có thể mang
+cùng pid — và khi đó danh tính phiên trước rỉ sang phiên sau, đúng kiểu lỗi mà
+`SET LOCAL ROLE` ở tầng app đã cất công tránh. `session_id` có dạng
+`<hex thời điểm mở phiên>.<hex pid>` nên duy nhất theo thời gian.
 
 Chính vì vậy `pgaudit.log` **phải có class `misc_set`** — đừng gỡ để cho log
 gọn. Class `role` chỉ bắt GRANT/REVOKE/CREATE ROLE, không bắt `SET ROLE`. Thiếu
@@ -292,6 +298,39 @@ toàn khả năng quy trách nhiệm.
 Lưu ý khi parse: khi client gửi nhiều câu trong một query string, dòng AUDIT
 của **mỗi** câu đều chứa nguyên văn cả chuỗi. Nên lọc theo trường class
 (`MISC,SET`, `READ,SELECT`...) chứ đừng tìm theo chuỗi câu lệnh.
+
+## analyzer/ — quy ước
+
+Đọc `analyzer/README.md` trước khi sửa. Dưới đây là phần dễ sai nhất.
+
+**Lọc theo `substatement_id`.** Trường thứ ba của dòng AUDIT: `= 1` là câu lệnh
+client gửi lên, `> 1` là câu lồng nhau — thân của các hàm SQL `SECURITY
+DEFINER` (`app.encrypt_text`, `app.decrypt_text`, `app.blind_index`). Riêng lần
+seed 6000 khách hàng để lại **47.017 dòng** `READ,SELECT`, gần như toàn bộ là
+thân hàm. Bỏ bước lọc này là mọi rule chìm trong nhiễu.
+
+Nhưng **đừng vứt** các dòng lồng nhau: đếm số lần thân hàm chứa
+`pgp_sym_decrypt` trong phạm vi một câu lệnh chính là **số bản ghi đã bị giải
+mã**. Đó là con số thật, không phải ước lượng — rule `BULK_DECRYPT` dựa vào nó.
+
+**`pgaudit.log_relation = on`** khiến một câu lệnh chạm 2 bảng sinh ra 2 dòng
+cùng `statement_id`. Phải gom lại, nếu không sẽ đếm trùng.
+
+**Cảnh báo không được chứa dữ liệu thật.** `pgaudit.log_parameter = off` chặn
+tham số, nhưng giá trị viết thẳng vào câu SQL thì vẫn nằm trong log (ví dụ
+`WHERE cccd_hash = app.blind_index('001201000001')`). Chép nguyên câu lệnh vào
+`audit.alerts` là thủng lớp 2 ngay tại lớp 3 — bảng `alerts` không hề được mã
+hóa. `src/redact.js` che mọi chuỗi ≥ 9 chữ số; `verify.sh` có phép thử riêng
+cho việc này.
+
+**`analyzer_user` không có `SELECT`.** Hệ quả: không dùng được `RETURNING id`
+(RETURNING đọc giá trị cột nên đòi `SELECT` trên cột đó — muốn xác nhận đã ghi
+thì `RETURNING` một hằng số), và không truy vấn được bảng để lọc trùng. Vị trí
+đã đọc được ghi nhớ ở `analyzer/.analyzer-state.json`.
+
+**Giờ đọc thẳng từ chuỗi timestamp, không dùng `new Date()`.** Chuỗi trong log
+đã là giờ địa phương của server (`log_timezone`); `new Date()` sẽ quy đổi sang
+múi giờ của máy chạy analyzer và làm rule `AFTER_HOURS` lệch vài tiếng.
 
 **Thiếu `secrets/` thì init sẽ fail.** Lần chạy đầu trên một máy mới phải
 `bash scripts/init-secrets.sh` trước (`scripts/reset.sh` đã tự gọi). Hàm đọc
@@ -310,7 +349,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 43 phép thử, phải đạt hết
+bash scripts/verify.sh         # 49 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

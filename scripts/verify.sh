@@ -148,6 +148,45 @@ expect "analyzer_user KHONG cham duoc du lieu nghiep vu" "permission denied for 
        "$(sql_an 'SELECT count(*) FROM app.customers;')"
 
 # -----------------------------------------------------------------------------
+section "LOP 3c - analyzer: phat hien hanh vi bat thuong"
+if ! command -v node >/dev/null 2>&1; then
+    printf '  \033[33mBO QUA\033[0m khong tim thay node - cai Node.js roi chay lai\n'
+elif [ ! -d analyzer/node_modules ]; then
+    printf '  \033[33mBO QUA\033[0m chua cai phu thuoc: cd analyzer && npm install\n'
+elif [ ! -f analyzer/.env ]; then
+    printf '  \033[33mBO QUA\033[0m thieu analyzer/.env - copy tu analyzer/.env.example\n'
+else
+    # Sinh hai hanh vi xau. CO Y chon hai cau KHONG phu thuoc thoi diem chay:
+    # rule AFTER_HOURS dua vao gio he thong nen khong dung lam tieu chi duoc -
+    # chay luc 10h sang va luc 2h sang se cho ket qua khac nhau.
+    #
+    # Cau thu hai co so CCCD viet thang trong SQL: vua de thu rule, vua de kiem
+    # chung analyzer CHE du lieu nhay cam truoc khi ghi vao audit.alerts.
+    sql_nv nv_hcm01 'SELECT count(app.decrypt_text(cccd)) FROM app.customers;' >/dev/null
+    sql_nv nv_hcm01 "SELECT full_name FROM app.customers WHERE cccd_hash = app.blind_index('079203000005') UNION SELECT password_hash FROM app.staff;" >/dev/null
+    sleep 2
+
+    # --dry-run: khong ghi vao audit.alerts, nen nghiem thu khong lam ban bang
+    # canh bao that.
+    ANALYZER_OUT="$(node analyzer/src/index.js --dry-run 2>&1)"
+
+    expect "analyzer phat hien giai ma hang loat" "BULK_DECRYPT" "$ANALYZER_OUT"
+    expect "analyzer phat hien dau vet UNION SELECT" "SQLI_UNION" "$ANALYZER_OUT"
+    expect "analyzer phat hien truy cap bang chua password_hash" "STAFF_CREDENTIAL_READ" "$ANALYZER_OUT"
+    # Diem mau chot cua ca lop 3: log tho chi ghi "app_user", canh bao phai goi
+    # duoc ten nhan vien that nho bam theo SET ROLE trong tung phien.
+    expect "canh bao quy trach nhiem cho nv_hcm01 (khong phai app_user)" "nv_hcm01" "$ANALYZER_OUT"
+    # So CCCD 12 chu so trong cau lenh phai bi che, neu khong thi lop 2 bi thung
+    # ngay tai bang canh bao - noi khong he duoc ma hoa.
+    expect "cau lenh trong canh bao da che du lieu nhay cam" "chu_so_da_che" "$ANALYZER_OUT"
+    if printf '%s' "$ANALYZER_OUT" | grep -qF '079203000005'; then
+        bad "CCCD KHONG lot ra canh bao o dang ro" "khong thay so CCCD" "tim thay 079203000005"
+    else
+        ok "CCCD KHONG lot ra canh bao o dang ro"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
 section "DU LIEU - khoi luong theo yeu cau de bai"
 N_CUST=$(sql_su 'SELECT count(*) FROM app.customers;')
 N_ORD=$(sql_su  'SELECT count(*) FROM app.orders;')

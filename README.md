@@ -6,7 +6,7 @@ Môi trường lab chạy local bằng Docker Compose, minh họa 4 lớp bảo 
 |-----|----------|-----------|
 | 1 | Host-based access control, Role/GRANT, Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột dữ liệu nhạy cảm bằng `pgcrypto` | **Xong** |
-| 3 | Giám sát truy cập bằng `pgAudit` + analyzer tự viết | pgAudit **xong**; analyzer ở bước sau |
+| 3 | Giám sát truy cập bằng `pgAudit` + analyzer tự viết | **Xong cả hai** |
 | 4 | Sao lưu WAL + `pg_dump` + PITR | WAL archiving **xong**; script backup/PITR ở bước sau |
 
 Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socket.IO
@@ -52,7 +52,17 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── db.js  app.js  server.js
 │       ├── middleware/     # requireAuth.js, setRole.js (SET LOCAL ROLE nv_xxx)
 │       └── routes/         # auth.js, customers.js, orders.js
-├── analyzer/  dashboard/   # giữ chỗ
+├── analyzer/               # lớp 3: đọc log pgAudit -> audit.alerts
+│   ├── package.json
+│   ├── .env.example
+│   └── src/
+│       ├── index.js        # CLI, chạy một lần rồi thoát
+│       ├── auditLine.js    # tách trường CSV bên trong `message` của pgAudit
+│       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
+│       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
+│       ├── alerts.js       # INSERT bằng analyzer_user
+│       └── rules/          # 6 rule phát hiện
+└── dashboard/              # giữ chỗ
 ```
 
 ## 2. Chạy
@@ -294,7 +304,7 @@ transaction, và cần thêm cột `key_version` để hỗ trợ giai đoạn h
 bash scripts/verify.sh
 ```
 
-Chạy 43 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 49 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
@@ -304,7 +314,7 @@ pgAudit ghi được câu lệnh và cả `SET ROLE`, `analyzer_user` ghi đư�
 nhưng không đọc/sửa/xóa được, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
 ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`.
 
-Kết quả mong đợi: `DAT: 43    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 49    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -385,8 +395,25 @@ thực nghiệm luận điểm defense-in-depth — chi tiết và cách khai th
 cd app && npm install && cp .env.example .env && npm run dev
 ```
 
+## 7b. `analyzer/` — lớp 3
+
+Đọc `logs/*.json`, bám `session_id` để quy trách nhiệm cho đúng nhân viên theo
+`SET ROLE`, áp 6 rule phát hiện, ghi cảnh báo vào `audit.alerts` bằng
+`analyzer_user` (chỉ `INSERT`).
+
+```bash
+cd analyzer && npm install && cp .env.example .env
+node src/index.js --dry-run --all    # xem thử, không ghi database
+node src/index.js                    # đọc phần log mới, ghi cảnh báo
+```
+
+Điểm cốt lõi: cột `user` trong log **luôn** là `app_user`, nên nhìn log thô thì
+không quy được trách nhiệm cho ai. Analyzer bám theo từng phiên để biết câu lệnh
+nào thuộc về `nv_hn01`, câu nào thuộc `nv_dn01`. Cách làm, bộ rule và **các giới
+hạn đã biết** (không đo được số dòng trả về, không bắt được IDOR) nằm ở
+[`analyzer/README.md`](analyzer/README.md).
+
 ## 8. Bước tiếp theo
 
-- **`analyzer/`** — đọc `logs/*.json`, bám `pid` để quy trách nhiệm theo `SET ROLE`, sinh cảnh báo vào `audit.alerts`. Role `analyzer_user` đã sẵn sàng (chỉ `INSERT`, xem bảng phân quyền ở mục 4); phần còn thiếu là code.
 - **`dashboard/`** — React + Socket.IO hiển thị `audit.alerts` realtime.
 - **`backup/scripts/`** — `pg_basebackup` làm mốc PITR, `pg_dump` định kỳ, kịch bản khôi phục bằng `recovery_target_time`.

@@ -16,6 +16,9 @@ backup/full/*
 backup/wal_archive/*
 !backup/wal_archive/.gitkeep
 
+# Vị trí analyzer đã đọc tới trong log - trạng thái riêng từng máy.
+.analyzer-state.json
+
 # --- Node (app / analyzer / dashboard ở các bước sau) -------------------
 node_modules/
 npm-debug.log*

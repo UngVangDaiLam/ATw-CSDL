@@ -29,6 +29,7 @@ services:
       READONLY_PASSWORD: ${READONLY_PASSWORD}
       ADMIN_PASSWORD:    ${ADMIN_PASSWORD}
       ANALYZER_PASSWORD: ${ANALYZER_PASSWORD}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
 
     # LỚP 2 - khóa mã hóa.
     # Mount thành file ở /run/secrets/ bên trong container, KHÔNG thành biến
@@ -45,7 +46,7 @@ services:
       # thành công và `docker compose up` không báo lỗi gì, nhưng mọi kết nối
       # tới localhost:5432 lại rơi vào instance native - rất khó phát hiện vì
       # nó cũng là PostgreSQL và cũng trả lời bình thường.
-      - "${POSTGRES_HOST_PORT:-55432}:5432"
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
 
     volumes:
       # PGDATA phải là NAMED VOLUME, không được bind-mount từ Windows:
@@ -68,6 +69,38 @@ services:
       timeout: 5s
       retries: 10
       start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # LỚP 4 - hai container công cụ cho PITR, KHÔNG chạy cùng `docker compose up`
+  # (profile `tools`). Script trong backup/scripts/ tự gọi chúng bằng
+  # `docker compose run`.
+  #
+  # pitr-restore: gắn vào CHÍNH volume pgdata để dựng lại data directory từ
+  #   base backup. Chỉ chạy khi service postgres đã dừng - pitr_restore.sh lo
+  #   việc đó.
+  # pitr-sandbox: volume RIÊNG, archive gắn read-only, không có mạng. Dùng để
+  #   thử khôi phục mà không đụng tới database đang chạy (verify.sh gọi mỗi
+  #   lần). Backup chưa từng restore thử thì chưa chắc đã là backup.
+  # ---------------------------------------------------------------------------
+  pitr-restore:
+    image: secdb/postgres:16-pgaudit
+    profiles: ["tools"]
+    entrypoint: ["bash"]
+    network_mode: none
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backup/wal_archive:/backup/wal_archive:ro
+      - ./backup/full:/backup/full
+
+  pitr-sandbox:
+    image: secdb/postgres:16-pgaudit
+    profiles: ["tools"]
+    entrypoint: ["bash"]
+    network_mode: none
+    volumes:
+      - pitr_sandbox:/var/lib/postgresql/data
+      - ./backup/wal_archive:/backup/wal_archive:ro
+      - ./backup/full:/backup/full:ro
 
   pgadmin:
     image: dpage/pgadmin4:8
@@ -98,6 +131,7 @@ secrets:
 volumes:
   pgdata:
   pgadmin_data:
+  pitr_sandbox:
 
 networks:
   dbnet:

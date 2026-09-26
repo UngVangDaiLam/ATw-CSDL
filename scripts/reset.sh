@@ -38,6 +38,8 @@ docker compose down -v
 
 echo "==> Don WAL archive, backup va log cu (giu .gitkeep)"
 find backup/wal_archive backup/full logs -type f ! -name '.gitkeep' -delete 2>/dev/null || true
+# full_backup.sh tạo mỗi lần một thư mục con - xóa file xong còn vỏ rỗng.
+find backup/full -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
 echo "==> Bao dam da co khoa ma hoa (khong ghi de neu da ton tai)"
 bash scripts/init-secrets.sh

@@ -27,7 +27,7 @@ module.exports = {
   // toi thieu ma lop 1 dang chung minh. Xem postgres/init/04_grants.sql.
   db: {
     host: process.env.DB_HOST || 'localhost',
-    port: num(process.env.DB_PORT, 55432),
+    port: num(process.env.DB_PORT, 15432),
     database: process.env.DB_NAME || 'secdb',
     user: process.env.DB_USER || 'analyzer_user',
     password: process.env.DB_PASSWORD,

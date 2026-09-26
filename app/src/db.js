@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 // hay db_owner. Xem postgres/init/02_roles.sh de biet role nay co quyen gi.
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
-  port: Number(process.env.DB_PORT) || 55432,
+  port: Number(process.env.DB_PORT) || 15432,
   database: process.env.DB_NAME,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,

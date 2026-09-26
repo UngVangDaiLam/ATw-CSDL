@@ -28,8 +28,8 @@ GRANT USAGE ON SCHEMA app TO app_user, readonly_user;
 -- 05_crypto.sql - chúng là SECURITY DEFINER nên tự chạy dưới quyền db_owner.
 -- Nhờ vậy mỗi lần giải mã là một lời gọi hàm có tên rõ ràng trong log pgAudit.
 --
--- audit: ngoài db_owner thì CHỈ analyzer_user chạm tới được, và chỉ bằng INSERT
--- (xem khối analyzer_user bên dưới).
+-- audit: ngoài db_owner thì CHỈ analyzer_user (chỉ INSERT) và dashboard_user
+-- (chỉ SELECT) chạm tới được - xem hai khối tương ứng bên dưới.
 
 -- =============================================================================
 -- app_user
@@ -120,6 +120,19 @@ GRANT INSERT ON audit.alerts       TO analyzer_user;
 -- Sequence của schema `audit` KHÔNG nằm trong ALTER DEFAULT PRIVILEGES ở cuối
 -- file (khối đó chỉ áp cho schema `app`), nên phải cấp tường minh ở đây.
 GRANT USAGE  ON SEQUENCE audit.alerts_id_seq TO analyzer_user;
+
+-- =============================================================================
+-- dashboard_user  (LỚP 3 - chiều đọc)
+--
+-- Nửa còn lại của analyzer_user: CHỈ SELECT trên audit.alerts.
+-- KHÔNG INSERT -> dashboard bị chiếm cũng không chèn được cảnh báo giả.
+-- KHÔNG UPDATE/DELETE -> không "đánh dấu đã xử lý" bằng cách sửa bảng. Cần
+--   tính năng đó thì làm bảng riêng (vd. audit.alert_ack), đừng nới quyền ở đây.
+-- KHÔNG sequence -> không cần, và nextval() là một thao tác ghi.
+-- KHÔNG USAGE trên `app` -> không đọc được dữ liệu nghiệp vụ.
+-- =============================================================================
+GRANT USAGE  ON SCHEMA audit TO dashboard_user;
+GRANT SELECT ON audit.alerts TO dashboard_user;
 
 -- =============================================================================
 -- admin_user

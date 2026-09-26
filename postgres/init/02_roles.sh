@@ -19,6 +19,7 @@ set -Eeuo pipefail
 : "${READONLY_PASSWORD:?READONLY_PASSWORD chưa được set trong .env}"
 : "${ADMIN_PASSWORD:?ADMIN_PASSWORD chưa được set trong .env}"
 : "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chưa được set trong .env}"
+: "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD chưa được set trong .env}"
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" \
@@ -28,7 +29,8 @@ psql -v ON_ERROR_STOP=1 \
      -v app_pw="$APP_USER_PASSWORD" \
      -v ro_pw="$READONLY_PASSWORD" \
      -v admin_pw="$ADMIN_PASSWORD" \
-     -v analyzer_pw="$ANALYZER_PASSWORD" <<-'EOSQL'
+     -v analyzer_pw="$ANALYZER_PASSWORD" \
+     -v dashboard_pw="$DASHBOARD_PASSWORD" <<-'EOSQL'
 
     -- =========================================================================
     -- ROLE SỞ HỮU
@@ -88,10 +90,26 @@ psql -v ON_ERROR_STOP=1 \
     --     phía ngoài, không cần truy vấn ngược lại bảng.
     --   - Không UPDATE/DELETE -> bảng cảnh báo là APPEND-ONLY. Bằng chứng đã
     --     ghi thì không sửa hay xóa được, kể cả bởi chính tiến trình đã ghi nó.
-    -- Vai trò ĐỌC alerts (cho dashboard ở bước 4) sẽ là một role khác nữa.
+    -- Vai trò ĐỌC alerts là dashboard_user ngay bên dưới.
     -- =========================================================================
     CREATE ROLE analyzer_user
         LOGIN PASSWORD :'analyzer_pw'
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+        CONNECTION LIMIT 5;
+
+    -- =========================================================================
+    -- ROLE DASHBOARD - LỚP 3, chiều ĐỌC
+    --
+    -- Đối xứng với analyzer_user: analyzer chỉ GHI được cảnh báo, dashboard
+    -- chỉ ĐỌC được cảnh báo. Không role nào vừa đọc vừa ghi -> muốn giả mạo
+    -- hoặc che giấu một cảnh báo thì phải chiếm được CẢ HAI tiến trình.
+    --
+    -- Không có USAGE trên schema `app`: dashboard hiển thị cảnh báo chứ không
+    -- hiển thị dữ liệu khách hàng. Nội dung câu lệnh trong `detail` đã được
+    -- analyzer che CCCD/số thẻ trước khi ghi (analyzer/src/redact.js).
+    -- =========================================================================
+    CREATE ROLE dashboard_user
+        LOGIN PASSWORD :'dashboard_pw'
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
         CONNECTION LIMIT 5;
 
@@ -144,7 +162,7 @@ psql -v ON_ERROR_STOP=1 \
     -- đích danh: role lạ (hoặc role tạo nhầm) sẽ không connect được.
     -- =========================================================================
     REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user, analyzer_user;
+    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user, analyzer_user, dashboard_user;
 
     -- =========================================================================
     -- THAM SỐ MẶC ĐỊNH THEO ROLE
@@ -172,6 +190,16 @@ psql -v ON_ERROR_STOP=1 \
     ALTER ROLE analyzer_user SET statement_timeout = '15s';
     ALTER ROLE analyzer_user SET application_name = 'secdb-analyzer';
 
+    -- Chỉ đọc ở MỨC PHIÊN, chồng lên việc không có quyền ghi ở mức bảng. Lớp
+    -- này mềm (role tự SET lại được), lớp GRANT ở 04_grants.sql mới là chốt
+    -- chặn thật - verify.sh thử cả hai. statement_timeout ngắn vì dashboard
+    -- poll liên tục: truy vấn chậm là dấu hiệu bất thường chứ không phải
+    -- thứ nên chờ.
+    ALTER ROLE dashboard_user SET search_path = audit;
+    ALTER ROLE dashboard_user SET default_transaction_read_only = on;
+    ALTER ROLE dashboard_user SET statement_timeout = '5s';
+    ALTER ROLE dashboard_user SET application_name = 'secdb-dashboard';
+
 EOSQL
 
-echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user / analyzer_user"
+echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user / analyzer_user / dashboard_user"

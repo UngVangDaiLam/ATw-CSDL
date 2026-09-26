@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 [ -f .env ] || { echo "Khong tim thay .env - copy tu .env.example truoc."; exit 1; }
 set -a; . ./.env; set +a
 : "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chua co trong .env - them vao (xem .env.example)}"
+: "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD chua co trong .env - them vao (xem .env.example)}"
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
 PASS=0; FAIL=0
@@ -30,6 +31,8 @@ sql_app() { docker compose exec -T postgres psql "$APP_URL" -tAc "$1" 2>&1; }
 sql_nv() { docker compose exec -T postgres psql "$APP_URL" -tAc "SET ROLE $1; $2" 2>&1 | grep -vx 'SET'; }
 # psql dưới quyền analyzer_user (TCP) - role của lớp 3, chỉ INSERT audit.alerts
 sql_an() { docker compose exec -T postgres psql "postgresql://analyzer_user:${ANALYZER_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
+# psql dưới quyền dashboard_user (TCP) - lớp 3 chiều đọc, chỉ SELECT audit.alerts
+sql_db() { docker compose exec -T postgres psql "postgresql://dashboard_user:${DASHBOARD_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mDAT  \033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mTRUOT\033[0m %s\n' "$1"; printf '        mong doi: %s\n        nhan duoc: %s\n' "$2" "$3"; }
@@ -72,6 +75,13 @@ expect "nv_hn01 khong INSERT duoc sang chi nhanh khac" "violates row-level secur
        "$(sql_nv nv_hn01 "INSERT INTO app.customers(branch_id,full_name) VALUES (2,'Chen lau');")"
 expect "nv_hn01 khong doi duoc branch_id sang chi nhanh khac" "violates row-level security policy" \
        "$(sql_nv nv_hn01 'UPDATE app.customers SET branch_id = 2 WHERE branch_id = 1;')"
+# Hiệu năng của chính policy: app.current_branch_id() phải được bọc trong
+# subquery để thành InitPlan (tính 1 lần/câu lệnh). Gọi thẳng thì với kế hoạch
+# quét theo khóa chính, hàm bị gọi lại cho TỪNG dòng - chậm hơn ~12 lần và mỗi
+# lần gọi thêm một dòng log pgAudit. Kết quả vẫn đúng nên không phép thử chức
+# năng nào bắt được lỗi này. Xem docs/performance.md mục 1.
+expect "policy RLS tinh chi nhanh 1 lan/cau lenh (InitPlan), khong phai moi dong" "InitPlan" \
+       "$(sql_nv nv_hn01 'EXPLAIN SELECT phone FROM app.customers ORDER BY id LIMIT 100;')"
 expect "db_owner bi FORCE RLS chan -> 0 dong" "0" \
        "$(sql_su 'SET ROLE db_owner; SELECT count(*) FROM app.customers;' | tail -1)"
 
@@ -148,6 +158,28 @@ expect "analyzer_user KHONG cham duoc du lieu nghiep vu" "permission denied for 
        "$(sql_an 'SELECT count(*) FROM app.customers;')"
 
 # -----------------------------------------------------------------------------
+section "LOP 3b' - dashboard_user: chi duoc DOC canh bao, khong duoc ghi"
+expect "dashboard_user ket noi duoc qua TCP (co dong rieng trong pg_hba)" "dashboard_user" \
+       "$(sql_db 'SELECT current_user;')"
+# Đọc được thật (không lỗi, ra một con số) chứ không chỉ "không bị từ chối".
+if printf '%s' "$(sql_db 'SELECT count(*) FROM audit.alerts;')" | grep -qE '^[0-9]+$'; then
+    ok "dashboard_user SELECT duoc audit.alerts"
+else bad "dashboard_user SELECT duoc audit.alerts" "mot con so" "$(sql_db 'SELECT count(*) FROM audit.alerts;' | cut -c1-120)"; fi
+# Lớp mềm: phiên mặc định read-only (ALTER ROLE ... default_transaction_read_only).
+expect "phien dashboard mac dinh chi doc" "read-only transaction" \
+       "$(sql_db "INSERT INTO audit.alerts(db_user,rule_triggered,risk_score) VALUES ('x','GIA_MAO',0);")"
+# Lớp cứng: tự mở transaction READ WRITE (role nào cũng làm được) thì GRANT vẫn
+# chặn. Đây mới là chốt chặn thật. Không thử bằng `SET default_transaction_
+# read_only = off; ...` được: psql -c gửi cả chuỗi trong MỘT transaction ngầm
+# đã mở ở chế độ read-only trước khi câu SET kịp có hiệu lực.
+expect "mo READ WRITE van KHONG chen duoc canh bao gia" "permission denied for table alerts" \
+       "$(sql_db "BEGIN READ WRITE; INSERT INTO audit.alerts(db_user,rule_triggered,risk_score) VALUES ('x','GIA_MAO',0); ROLLBACK;")"
+expect "mo READ WRITE van KHONG xoa duoc canh bao" "permission denied for table alerts" \
+       "$(sql_db 'BEGIN READ WRITE; DELETE FROM audit.alerts; ROLLBACK;')"
+expect "dashboard_user KHONG cham duoc du lieu nghiep vu" "permission denied for schema app" \
+       "$(sql_db 'SELECT count(*) FROM app.customers;')"
+
+# -----------------------------------------------------------------------------
 section "LOP 3c - analyzer: phat hien hanh vi bat thuong"
 if ! command -v node >/dev/null 2>&1; then
     printf '  \033[33mBO QUA\033[0m khong tim thay node - cai Node.js roi chay lai\n'
@@ -221,6 +253,67 @@ done
 if [ -n "$ARCHIVED" ]; then ok "segment $WALFILE da duoc archive sang backup/wal_archive/"
 else bad "segment WAL vua dong duoc archive" "co file $WALFILE" "khong thay sau 15s"; fi
 expect "khong co lan archive nao that bai" "0" "$(sql_su 'SELECT failed_count FROM pg_stat_archiver;')"
+
+# -----------------------------------------------------------------------------
+section "LOP 4b - Base backup, pg_dump va PITR"
+. backup/scripts/lib.sh
+
+# `all` trong pg_hba KHÔNG phủ kết nối replication. Chỉ có dòng
+# `local replication postgres` nên qua TCP không role nào lấy được bản sao
+# vật lý của cả cluster - kể cả khi mật khẩu đúng.
+# Phải thử replication=true (VẬT LÝ - thứ pg_basebackup dùng). replication=
+# database là replication LOGIC, khớp với các dòng `all` thông thường nên đi
+# qua pg_hba và chỉ bị chặn ở bước sau vì role thiếu thuộc tính REPLICATION.
+expect "ket noi replication vat ly qua TCP bi pg_hba tu choi" "no pg_hba.conf entry for replication connection" \
+       "$(docker compose exec -T postgres psql "postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb?replication=true" -c 'IDENTIFY_SYSTEM;' 2>&1)"
+
+NOW_EPOCH=$(sql_su 'SELECT floor(extract(epoch FROM now()))::bigint;')
+BASE=$(pick_base "$NOW_EPOCH")
+if [ -z "$BASE" ]; then
+    echo "  (chua co base backup - tao mot ban bang backup/scripts/full_backup.sh)"
+    bash backup/scripts/full_backup.sh >/dev/null 2>&1
+    sleep 1
+    BASE=$(pick_base "$(sql_su 'SELECT floor(extract(epoch FROM now()))::bigint;')")
+fi
+if [ -n "$BASE" ] && [ -f "backup/full/$BASE/base.tar.gz" ] && [ -f "backup/full/$BASE/backup_manifest" ]; then
+    ok "co base backup $BASE (base.tar.gz + backup_manifest)"
+else bad "co base backup" "backup/full/<ten>/base.tar.gz" "${BASE:-khong co}"; fi
+expect "ban pg_dump doc duoc, co du lieu bang customers" "TABLE DATA app customers" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres pg_restore -l "/backup/full/$BASE/secdb.dump" 2>&1)"
+
+# Khôi phục THẬT sự, nhưng trong container sandbox (volume riêng, archive
+# read-only, không promote) - database đang chạy không bị đụng tới.
+# Mốc đo nằm ở database riêng pitr_probe để không phải ghi vào dữ liệu nghiệp
+# vụ: một dòng commit TRƯỚC thời điểm T, một dòng commit SAU. Khôi phục đúng
+# thì chỉ thấy dòng thứ nhất.
+sql_su 'DROP DATABASE IF EXISTS pitr_probe;' >/dev/null
+sql_su 'CREATE DATABASE pitr_probe;' >/dev/null
+sql_su 'REVOKE ALL ON DATABASE pitr_probe FROM PUBLIC;' >/dev/null
+docker compose exec -T postgres psql -U postgres -d pitr_probe -tAc \
+    "CREATE TABLE probe(v text); INSERT INTO probe VALUES ('truoc');" >/dev/null
+sleep 1
+PITR_T=$(sql_su 'SELECT now()::text;')
+sleep 1
+docker compose exec -T postgres psql -U postgres -d pitr_probe -tAc "INSERT INTO probe VALUES ('sau');" >/dev/null
+HIST_BEFORE=$(ls backup/wal_archive | grep -c '\.history$' || true)
+if flush_wal >/dev/null; then
+    SANDBOX_OUT=$(docker compose run --rm -T pitr-sandbox -s -- sandbox "$BASE" "$PITR_T" pitr_probe \
+        "SELECT count(*) FILTER (WHERE v='truoc') || '/' || count(*) FILTER (WHERE v='sau') FROM probe;" \
+        < backup/scripts/_restore_inner.sh 2>&1)
+else
+    SANDBOX_OUT="khong archive duoc WAL"
+fi
+sql_su 'DROP DATABASE IF EXISTS pitr_probe;' >/dev/null
+
+expect "base backup khop checksum voi backup_manifest (pg_verifybackup)" "backup successfully verified" "$SANDBOX_OUT"
+# 1/0: có dòng commit trước T, KHÔNG có dòng commit sau T.
+expect "PITR dung chinh xac tai T: giu dong truoc, bo dong sau" "KET_QUA=1/0" "$SANDBOX_OUT"
+# Sandbox mà promote thì sẽ ghi file .history của một timeline mới vào kho
+# archive - lần PITR thật tiếp theo (recovery_target_timeline = latest) sẽ đi
+# theo timeline ma đó. Số file .history phải giữ nguyên.
+HIST_AFTER=$(ls backup/wal_archive | grep -c '\.history$' || true)
+if [ "$HIST_BEFORE" = "$HIST_AFTER" ]; then ok "sandbox khong sinh timeline moi trong kho WAL"
+else bad "sandbox khong sinh timeline moi trong kho WAL" "$HIST_BEFORE file .history" "$HIST_AFTER"; fi
 
 # -----------------------------------------------------------------------------
 printf '\n\033[1m============================================\033[0m\n'

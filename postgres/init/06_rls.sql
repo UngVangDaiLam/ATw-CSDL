@@ -103,24 +103,34 @@ ALTER TABLE app.payments  FORCE  ROW LEVEL SECURITY;
 -- không phải TRUE - tức app_user đọc ra 0 dòng. Đây là chủ đích: chiếm được
 -- mật khẩu app_user vẫn chưa lấy được dữ liệu, còn phải SET ROLE, mà SET ROLE
 -- thì bị pgAudit ghi lại.
+--
+-- VÌ SAO `(SELECT app.current_branch_id())` CHỨ KHÔNG GỌI HÀM TRỰC TIẾP:
+-- Gọi thẳng thì khi planner dùng được index trên branch_id, hàm chạy 1 lần
+-- (Index Cond); nhưng khi planner chọn đường khác - vd. quét theo khóa chính
+-- cho `ORDER BY id LIMIT 100` - điều kiện RLS thành `Filter` và hàm chạy LẠI
+-- CHO TỪNG DÒNG. Mỗi lần là một truy vấn vào app.staff qua hàm SECURITY
+-- DEFINER (không inline được), và mỗi truy vấn đó còn sinh thêm một dòng log
+-- pgAudit. Bọc trong subquery biến nó thành InitPlan: tính đúng MỘT lần cho
+-- mỗi câu lệnh. Ngữ nghĩa không đổi vì current_user cố định trong suốt một
+-- câu lệnh. Số đo trước/sau: docs/benchmark-results.md.
 -- -----------------------------------------------------------------------------
 CREATE POLICY branch_isolation ON app.customers
     FOR ALL
     TO staff_role, app_user, readonly_user
-    USING      (branch_id = app.current_branch_id())
-    WITH CHECK (branch_id = app.current_branch_id());
+    USING      (branch_id = (SELECT app.current_branch_id()))
+    WITH CHECK (branch_id = (SELECT app.current_branch_id()));
 
 CREATE POLICY branch_isolation ON app.orders
     FOR ALL
     TO staff_role, app_user, readonly_user
-    USING      (branch_id = app.current_branch_id())
-    WITH CHECK (branch_id = app.current_branch_id());
+    USING      (branch_id = (SELECT app.current_branch_id()))
+    WITH CHECK (branch_id = (SELECT app.current_branch_id()));
 
 CREATE POLICY branch_isolation ON app.payments
     FOR ALL
     TO staff_role, app_user, readonly_user
-    USING      (branch_id = app.current_branch_id())
-    WITH CHECK (branch_id = app.current_branch_id());
+    USING      (branch_id = (SELECT app.current_branch_id()))
+    WITH CHECK (branch_id = (SELECT app.current_branch_id()));
 
 RESET ROLE;
 

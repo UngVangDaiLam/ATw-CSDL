@@ -15,9 +15,9 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
 | 3 | `pgAudit` + analyzer tự viết | **Xong** (6 rule, ghi `audit.alerts` bằng `analyzer_user`) |
-| 4 | WAL archive + `pg_dump` + PITR | Archiving xong; **`backup/scripts/` rỗng** |
+| 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (49 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (62 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -26,7 +26,8 @@ Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_gra
 Stack dự kiến: PostgreSQL 16 · Node.js + Express (`app/`) · Node.js
 (`analyzer/`) · React + Socket.IO (`dashboard/`). `app/` và `analyzer/` đã có
 code (xem `app/README.md`, `analyzer/README.md` và hai mục quy ước bên dưới);
-`dashboard/` hiện chỉ có README giữ chỗ.
+`dashboard/` chưa có code, nhưng phía DB đã sẵn (`dashboard_user`, xem
+`dashboard/README.md`).
 
 ## Lệnh thường dùng
 
@@ -41,8 +42,8 @@ docker compose exec postgres psql -U postgres -d secdb
 # Role nghiệp vụ, từ trong container (chú ý IP, xem "Bẫy 4")
 docker compose exec postgres psql "postgresql://app_user:<mk>@172.28.0.10:5432/secdb"
 
-# Từ máy host — cổng 55432, KHÔNG phải 5432
-psql "postgresql://app_user@localhost:55432/secdb"
+# Từ máy host — cổng 15432, KHÔNG phải 5432
+psql "postgresql://app_user@localhost:15432/secdb"
 ```
 
 Mật khẩu nằm trong `.env` (không commit). Lấy ra để chạy test:
@@ -98,7 +99,7 @@ Loopback không thuộc `172.28.0.0/16` nên rơi vào luật `reject` cuối c�
 `pg_hba.conf`. Subnet được ghim cứng trong `docker-compose.yml`; nếu đổi subnet
 thì phải sửa `pg_hba.conf` cho khớp.
 
-**5. Cổng host là `55432` (`POSTGRES_HOST_PORT` trong `.env`).**
+**5. Cổng host là `15432` (`POSTGRES_HOST_PORT` trong `.env`).**
 Máy dev thường đã cài PostgreSQL native chiếm `5432`. Khi trùng, Docker **vẫn
 bind thành công, không báo lỗi**, nhưng kết nối `localhost:5432` lại đi vào
 instance native — triệu chứng rất đánh lừa ("sai mật khẩu", "không có bảng
@@ -108,6 +109,13 @@ instance native — triệu chứng rất đánh lừa ("sai mật khẩu", "kh�
 SELECT current_setting('server_version'), inet_server_addr();
 -- phải ra 16.x và 172.28.0.10
 ```
+
+**Đừng chọn cổng ≥ 49152.** Đó là dải cổng động của Windows; sau mỗi lần khởi
+động, Hyper-V/WinNAT giữ chỗ ngẫu nhiên từng khối 100 cổng trong dải này
+(`netsh interface ipv4 show excludedportrange protocol=tcp`). Trúng khối đó
+thì `docker compose up` báo `bind: An attempt was made to access a socket in a
+way forbidden by its access permissions` — lỗi lúc có lúc không. Cổng cũ
+`55432` đã dính đúng lỗi này.
 
 Hoặc kiểm tra log container có ghi nhận lần kết nối đó không — không thấy nghĩa
 là đã đi nhầm server.
@@ -166,7 +174,12 @@ dữ liệu, nhờ vậy số đo hiệu năng giữa các lần chạy mới so
   không `SELECT`, không `UPDATE`/`DELETE`. Bảng là append-only: analyzer ghi
   được nhưng không đọc ngược hay xóa được thứ nó đã ghi. Đừng cấp thêm
   `SELECT` cho nó "để tiện lọc trùng" — analyzer tự nhớ vị trí đã đọc bằng
-  offset file bên ngoài. Vai trò đọc `alerts` cho dashboard sẽ là role khác.
+  offset file bên ngoài. Chiều đọc là `dashboard_user`: **chỉ `SELECT`** trên
+  `alerts`, không `INSERT` (không chèn được cảnh báo giả), không chạm `app`.
+  Không role nào vừa đọc vừa ghi `alerts` — giữ nguyên tính đối xứng này.
+  Dashboard phải **poll** (`WHERE id > $last`), **không** dùng trigger +
+  `pg_notify`: `LISTEN` không cần quyền gì, `app_user` nghe được là biết mình
+  vừa bị phát hiện. Xem `dashboard/README.md`.
 - `ext` — `pgcrypto`. Để riêng vì `PUBLIC` có `USAGE` mặc định trên `public`;
   đặt pgcrypto ở đó thì mọi role đều gọi được `pgp_sym_decrypt()`. Gọi hàm phải
   qualify `ext.` (hoặc dựa vào `search_path` đã set sẵn cho `app_user`).
@@ -233,6 +246,22 @@ app.blind_index(text)   -> bytea
   hổng phổ biến nhất của RLS.
 - `UPDATE` trúng dòng của chi nhánh khác **không báo lỗi**, chỉ trả `UPDATE 0`.
   Dòng đó vô hình chứ không phải bị từ chối.
+- **Policy phải viết `(SELECT app.current_branch_id())`, đừng "rút gọn" thành
+  gọi hàm trực tiếp.** Gọi thẳng thì khi planner quét theo khóa chính (vd.
+  `ORDER BY id LIMIT 100`), điều kiện RLS thành `Filter` và hàm chạy lại cho
+  **từng dòng** — chậm ×12 và mỗi lần gọi thêm một dòng log pgAudit. Kết quả
+  vẫn đúng nên chỉ phép thử `InitPlan` trong `verify.sh` bắt được. Chi tiết:
+  `docs/performance.md` mục 1.
+
+## Hiệu năng
+
+`bash scripts/benchmark.sh` đo từng cặp có/không cơ chế (`scripts/bench/*.sql`)
+và ghi `docs/benchmark-results.md`; phân tích viết tay ở `docs/performance.md`.
+Chạy bằng superuser qua socket (analyzer bỏ qua, và mới đặt được
+`pgaudit.log` theo phiên). Sửa policy RLS, hàm mã hóa hay cấu hình pgAudit thì
+chạy lại và cập nhật `performance.md` nếu số thay đổi đáng kể. Giải mã chậm
+(~1,4 ms/bản ghi, phần lớn là đọc file khóa) là **đánh đổi có chủ đích** —
+đừng cache khóa vào biến phiên, xem mục "Mã hóa (lớp 2)".
 
 ## app/ — quy ước
 
@@ -343,13 +372,35 @@ khóa cố ý `RAISE EXCEPTION` kèm HINT thay vì im lặng dùng khóa mặc �
 git diff --cached --name-only | grep -E '^\.env$|^secrets/'   # phải không ra gì
 ```
 
+## backup/ — quy ước (lớp 4)
+
+Xem mục 7c trong `README.md`. Phần dễ sai:
+
+- **Sandbox KHÔNG được promote.** `pitr-sandbox` dừng bằng
+  `recovery_target_action=pause`, gắn archive read-only và chạy
+  `archive_mode=off`. Promote là sinh file `.history` của một timeline mới
+  trong kho WAL; lần PITR thật sau đó (`recovery_target_timeline = latest`)
+  sẽ đi theo timeline ma của sandbox. `verify.sh` có phép thử đếm `.history`.
+- **Cấu hình recovery ghi vào `postgresql.auto.conf`**, không phải
+  `postgresql.conf` — file đó nằm trong image (xem "Bẫy 2"). `pitr_restore.sh`
+  `ALTER SYSTEM RESET` chúng sau khi promote.
+- **Script gọi `docker compose exec ... /đường/dẫn` phải
+  `export MSYS_NO_PATHCONV=1`.** Git Bash tự đổi `/backup/full/x` thành
+  `C:/Program Files/Git/backup/full/x` trước khi chuyển cho `docker.exe`.
+  `lib.sh` đã export sẵn.
+- **Kiểm tra chặn replication phải dùng `replication=true`** (vật lý, thứ
+  `pg_basebackup` dùng). `replication=database` là logic, khớp dòng `all`
+  thông thường nên KHÔNG đi vào nhánh `replication` của `pg_hba`.
+- `pitr_restore.sh` cất data cũ vào `backup/full/pre_pitr_*.tar.gz` trước khi
+  ghi đè — lưới an toàn nếu chọn nhầm thời điểm.
+
 ## Nghiệm thu
 
 Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 49 phép thử, phải đạt hết
+bash scripts/verify.sh         # 62 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

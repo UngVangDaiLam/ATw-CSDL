@@ -7,7 +7,7 @@ Môi trường lab chạy local bằng Docker Compose, minh họa 4 lớp bảo 
 | 1 | Host-based access control, Role/GRANT, Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột dữ liệu nhạy cảm bằng `pgcrypto` | **Xong** |
 | 3 | Giám sát truy cập bằng `pgAudit` + analyzer tự viết | **Xong cả hai** |
-| 4 | Sao lưu WAL + `pg_dump` + PITR | WAL archiving **xong**; script backup/PITR ở bước sau |
+| 4 | Sao lưu WAL + `pg_dump` + PITR | **Xong** (base backup, dump, PITR có demo + thử khôi phục tự động) |
 
 Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socket.IO
 
@@ -36,15 +36,20 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 30 tiêu chí nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 62 phép thử nghiệm thu
+│   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
+│   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
+│   ├── bench/              # kịch bản pgbench, mỗi cặp chỉ khác đúng một cơ chế
 │   └── reset.sh            # dựng lại lab từ số 0 (dọn cả WAL archive)
 ├── backup/
 │   ├── full/               # bản sao lưu đầy đủ (pg_basebackup / pg_dump)
 │   ├── wal_archive/        # đích của archive_command
-│   └── scripts/            # script backup & PITR (bước sau)
+│   └── scripts/            # full_backup.sh, pitr_restore.sh, demo_pitr.sh - xem mục 7c
 ├── logs/                   # log csv + json của PostgreSQL, nguồn cho analyzer
 ├── docs/
-│   └── threat-model.md     # STRIDE cho app/, ranh giới tin cậy app <-> DB
+│   ├── threat-model.md     # STRIDE cho app/, ranh giới tin cậy app <-> DB
+│   ├── performance.md      # phân tích chi phí hiệu năng từng lớp (viết tay)
+│   └── benchmark-results.md # số đo thô, sinh bởi scripts/benchmark.sh
 ├── app/                    # backend Express - xem app/README.md
 │   ├── package.json
 │   ├── .env.example
@@ -62,7 +67,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
 │       └── rules/          # 6 rule phát hiện
-└── dashboard/              # giữ chỗ
+└── dashboard/              # chưa có code; phía DB đã sẵn - xem dashboard/README.md
 ```
 
 ## 2. Chạy
@@ -110,20 +115,20 @@ docker compose exec postgres psql -U postgres -d secdb
 
 ### Các role nghiệp vụ — từ máy host
 
-> **Cổng là `55432`, không phải `5432`.** Xem mục 6 để biết lý do.
+> **Cổng là `15432`, không phải `5432`.** Xem mục 6 để biết lý do.
 
 ```bash
 # app_user: SELECT/INSERT/UPDATE trên customers, orders, payments
-psql "postgresql://app_user@localhost:55432/secdb"
+psql "postgresql://app_user@localhost:15432/secdb"
 
 # readonly_user: chỉ SELECT customers, orders
-psql "postgresql://readonly_user@localhost:55432/secdb"
+psql "postgresql://readonly_user@localhost:15432/secdb"
 
 # admin_user: quản trị, phải SET ROLE db_owner để làm DDL
-psql "postgresql://admin_user@localhost:55432/secdb"
+psql "postgresql://admin_user@localhost:15432/secdb"
 
 # db_owner: chủ sở hữu schema app/audit
-psql "postgresql://db_owner@localhost:55432/secdb"
+psql "postgresql://db_owner@localhost:15432/secdb"
 ```
 
 Kiểm tra mình đang nói chuyện với đúng server:
@@ -170,6 +175,7 @@ chỉ với các role nghiệp vụ.
 | `readonly_user` | có | `SELECT` trên `customers`, `orders` của chi nhánh mình. Bị ép `default_transaction_read_only = on` |
 | `admin_user` | có | không có quyền trực tiếp trên bảng; `SET ROLE db_owner` để làm DDL |
 | `analyzer_user` | có | **chỉ `INSERT` trên `audit.alerts`** — không đọc, không sửa, không xóa; không chạm được schema `app` |
+| `dashboard_user` | có | **chỉ `SELECT` trên `audit.alerts`** — không ghi (không chèn được cảnh báo giả); không chạm được schema `app`. Phiên mặc định read-only |
 
 Ba cơ chế xếp chồng khiến `app_user` không thể DROP bảng:
 
@@ -204,7 +210,7 @@ chạy dưới danh tính người trước.
 Thử trực tiếp:
 
 ```bash
-psql "postgresql://app_user@localhost:55432/secdb"
+psql "postgresql://app_user@localhost:15432/secdb"
 ```
 ```sql
 SELECT count(*) FROM app.customers;               -- 0  (chưa SET ROLE)
@@ -304,17 +310,21 @@ transaction, và cần thêm cột `key_version` để hỗ trợ giai đoạn h
 bash scripts/verify.sh
 ```
 
-Chạy 49 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 62 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
 role nghiệp vụ không chạm được khóa, `readonly_user` không đọc được cột `cccd`,
 **`pg_dump` không chứa CCCD hay số thẻ ở dạng rõ**, khóa không rò vào log,
 pgAudit ghi được câu lệnh và cả `SET ROLE`, `analyzer_user` ghi được cảnh báo
-nhưng không đọc/sửa/xóa được, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
-ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`.
+nhưng không đọc/sửa/xóa được, `dashboard_user` đọc được cảnh báo nhưng không
+ghi được kể cả khi tự mở transaction READ WRITE, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
+ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`,
+replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, và **một lần
+PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
+đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 49    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 62    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -327,13 +337,21 @@ dòng ngay trong trường `message`).
 **Múi giờ.** `log_timezone = 'Asia/Ho_Chi_Minh'`. Để mặc định UTC thì rule
 "truy cập ngoài giờ hành chính" ở bước 3 sẽ lệch 7 tiếng.
 
-**Cổng host là 55432.** Nếu máy đã cài PostgreSQL native (trên Windows là
+**Cổng host là 15432.** Nếu máy đã cài PostgreSQL native (trên Windows là
 service `postgresql-x64-NN` nghe `0.0.0.0:5432`) thì cổng 5432 đã bị chiếm.
 Éo le là Docker **vẫn bind thành công và không báo lỗi gì**, nhưng kết nối tới
 `localhost:5432` lại rơi vào instance native. Vì cả hai đều là PostgreSQL và
 đều trả lời bình thường, triệu chứng nhìn rất giống lỗi cấu hình của lab:
 "sai mật khẩu app_user", "không có bảng app.customers", "pg_hba không có tác
-dụng"... Đổi cổng host tránh hẳn lớp nhầm lẫn này. Kiểm tra bằng PowerShell:
+dụng"... Đổi cổng host tránh hẳn lớp nhầm lẫn này.
+
+Cổng mới phải **dưới 49152**: từ 49152 trở lên là dải cổng động của Windows,
+Hyper-V/WinNAT giữ chỗ ngẫu nhiên từng khối trong dải đó sau mỗi lần khởi động
+và Docker sẽ báo `bind: An attempt was made to access a socket in a way
+forbidden by its access permissions` (cổng cũ 55432 đã gặp lỗi này). Xem các
+khối đang bị giữ: `netsh interface ipv4 show excludedportrange protocol=tcp`.
+
+Kiểm tra PostgreSQL native bằng PowerShell:
 
 ```powershell
 Get-NetTCPConnection -LocalPort 5432 -State Listen
@@ -413,7 +431,61 @@ nào thuộc về `nv_hn01`, câu nào thuộc `nv_dn01`. Cách làm, bộ rule 
 hạn đã biết** (không đo được số dòng trả về, không bắt được IDOR) nằm ở
 [`analyzer/README.md`](analyzer/README.md).
 
+## 7c. `backup/scripts/` — lớp 4
+
+```bash
+bash backup/scripts/full_backup.sh                                # base backup + pg_dump
+bash backup/scripts/pitr_restore.sh "2026-09-26 14:30:00+07"      # khôi phục DB đang chạy về thời điểm đó
+bash backup/scripts/demo_pitr.sh                                  # kịch bản demo, dừng chờ Enter từng bước
+```
+
+| File | Việc |
+|------|------|
+| `full_backup.sh` | Tạo `backup/full/<YYYYMMDD_HHMMSS>/`: `base.tar.gz` + `pg_wal.tar.gz` + `backup_manifest` (pg_basebackup, bản vật lý — điểm xuất phát của PITR), `secdb.dump` (pg_dump -Fc, bản logic), `backup_info` (thời điểm hoàn tất). |
+| `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại vào `backup/full/pre_pitr_*.tar.gz` → giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery. |
+| `demo_pitr.sh` | Ghi mốc T → `app_user` thử `DELETE` (lớp 1 chặn) → superuser xóa nhầm toàn bộ `orders`/`payments` → PITR về T → so khớp số dòng và tổng tiền. |
+| `_restore_inner.sh` | Phần chạy **bên trong** container (`pitr-restore` hoặc `pitr-sandbox` trong `docker-compose.yml`, profile `tools`). Không gọi trực tiếp. |
+| `lib.sh` | Hàm dùng chung: chọn base backup, flush WAL, đọc timeline. |
+
+Những điều cần biết:
+
+- **Chỉ quay về được thời điểm SAU lần `full_backup.sh` gần nhất có trước nó.**
+  Chưa có base backup thì không có PITR, dù WAL archive đầy đủ.
+- **PITR quay lui cả cluster**, kể cả `audit.alerts`. Log pgAudit ở `./logs/`
+  thì còn nguyên vì nằm ngoài database.
+- Sau mỗi lần khôi phục, cluster sang **timeline mới** (`00000002...`). WAL của
+  timeline cũ vẫn nằm trong archive và không bị ghi đè vì khác tên, nên chọn
+  nhầm thời điểm thì vẫn khôi phục lại được về sau sự cố.
+- `verify.sh` thử khôi phục thật trong container **`pitr-sandbox`** (volume
+  riêng, archive gắn read-only, `archive_mode=off`, dừng ở `pause` chứ không
+  promote) nên không ảnh hưởng database đang chạy và không sinh timeline ma
+  trong kho WAL.
+- Backup chạy bằng superuser qua socket (`local replication postgres trust` ở
+  `pg_hba.conf`). Qua TCP không có dòng `replication` nào nên mọi role đều bị
+  từ chối. Role backup riêng qua TCP cần `REPLICATION` + `BYPASSRLS` (vì
+  `FORCE RLS` chặn `pg_dump`), tức là quyền đọc toàn bộ dữ liệu — không hẹp
+  hơn superuser-qua-socket là bao, nên lab không tạo.
+
+## 7d. Hiệu năng
+
+```bash
+bash scripts/benchmark.sh     # ~2-3 phút, ghi docs/benchmark-results.md
+```
+
+Đo từng cặp có/không cơ chế bằng `pgbench`. Kết quả chính (phân tích đầy đủ ở
+[`docs/performance.md`](docs/performance.md)):
+
+| Cơ chế | Chi phí |
+|---|---|
+| RLS | ~0,1 ms/câu lệnh (+12–31%), không tăng theo số dòng |
+| Giải mã CCCD | ~1,4 ms **mỗi bản ghi** — chỉ giải mã dòng đang hiển thị |
+| Blind index so với giải mã để tìm | 2,7 ms so với 2 777 ms (×1 000) |
+| pgAudit | ×3 latency, ~5,5 KB log mỗi giao dịch |
+
+Chính việc đo đã tìm ra một lỗi hiệu năng trong policy RLS (hàm bị gọi lại cho
+từng dòng, chậm ×12) mà không phép thử chức năng nào bắt được — xem mục 1 của
+`docs/performance.md`.
+
 ## 8. Bước tiếp theo
 
 - **`dashboard/`** — React + Socket.IO hiển thị `audit.alerts` realtime.
-- **`backup/scripts/`** — `pg_basebackup` làm mốc PITR, `pg_dump` định kỳ, kịch bản khôi phục bằng `recovery_target_time`.

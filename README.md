@@ -36,7 +36,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 83 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 89 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -339,7 +339,7 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
 bash scripts/verify.sh
 ```
 
-Chạy 83 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 89 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
@@ -484,7 +484,7 @@ bash backup/scripts/demo_pitr.sh                                  # kịch bản
 | File | Việc |
 |------|------|
 | `full_backup.sh` | Tạo `backup/full/<YYYYMMDD_HHMMSS>/`: `base.tar.gz` + `pg_wal.tar.gz` + `backup_manifest` (pg_basebackup, bản vật lý — điểm xuất phát của PITR), `secdb.dump` (pg_dump -Fc, bản logic), `backup_info` (thời điểm hoàn tất). |
-| `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại vào `backup/full/pre_pitr_*.tar.gz` → giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery. |
+| `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại vào `backup/full/pre_pitr_*.tar.gz` → giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery → analyzer ghi bù cảnh báo bị quay lui (xem dưới). Tạm dừng service `analyzer` suốt quá trình. |
 | `demo_pitr.sh` | Ghi mốc T → `app_user` thử `DELETE` (lớp 1 chặn) → superuser xóa nhầm toàn bộ `orders`/`payments` → PITR về T → so khớp số dòng và tổng tiền. |
 | `_restore_inner.sh` | Phần chạy **bên trong** container (`pitr-restore` hoặc `pitr-sandbox` trong `docker-compose.yml`, profile `tools`). Không gọi trực tiếp. |
 | `lib.sh` | Hàm dùng chung: chọn base backup, flush WAL, đọc timeline. |
@@ -494,7 +494,11 @@ Những điều cần biết:
 - **Chỉ quay về được thời điểm SAU lần `full_backup.sh` gần nhất có trước nó.**
   Chưa có base backup thì không có PITR, dù WAL archive đầy đủ.
 - **PITR quay lui cả cluster**, kể cả `audit.alerts`. Log pgAudit ở `./logs/`
-  thì còn nguyên vì nằm ngoài database.
+  thì còn nguyên vì nằm ngoài database — nên `pitr_restore.sh` cho analyzer
+  **ghi bù** cảnh báo của các sự kiện sau mốc khôi phục (`--replay-after`).
+  Thiếu bước này, khôi phục để gỡ hậu quả một vụ tấn công sẽ xóa luôn chính
+  các cảnh báo về vụ đó (đã tái hiện và sửa). Dashboard không đọc DB khi nó
+  đang replay WAL, và bắt trình duyệt tải lại sau khi khôi phục xong.
 - Sau mỗi lần khôi phục, cluster sang **timeline mới** (`00000002...`). WAL của
   timeline cũ vẫn nằm trong archive và không bị ghi đè vì khác tên, nên chọn
   nhầm thời điểm thì vẫn khôi phục lại được về sau sự cố.

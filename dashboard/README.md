@@ -105,6 +105,8 @@ Các rule và gợi ý màu:
 | `SQLI_SCHEMA_PROBE` | 70 | dò `information_schema` / `pg_catalog` |
 | `FULL_TABLE_READ` | 60 | đọc bảng nhạy cảm không có `WHERE` |
 | `AFTER_HOURS` | 40 | truy cập ngoài 7h–19h hoặc cuối tuần |
+| `LOGIN_BRUTE_FORCE` | 80–90 | dò mật khẩu bị khóa tạm — từ tầng web, `db_user = web` |
+| `CSRF_BLOCKED` | 50–70 | request ghi bị chặn vì CSRF — từ tầng web, `db_user = web` |
 
 Phân mức: `>= 80` đỏ (Nghiêm trọng), `60–79` hổ phách (Cảnh giác), `< 60`
 xanh dương (Lưu ý). Mức thấp nhất không dùng vàng vì vàng và cam quá gần nhau,

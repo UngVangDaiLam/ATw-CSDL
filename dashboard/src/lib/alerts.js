@@ -34,6 +34,18 @@ export const RULES = {
     label: 'Đọc toàn bảng nhạy cảm',
     hint: 'SELECT trên bảng nhạy cảm mà không có WHERE',
   },
+  // Hai rule duoi den tu TANG WEB (app/src/securityLog.js -> analyzer/src/
+  // appEvents.js), khong phai tu log pgAudit.
+  LOGIN_BRUTE_FORCE: {
+    score: 80,
+    label: 'Dò mật khẩu',
+    hint: 'Đăng nhập sai liên tiếp tới mức bị khóa tạm — dấu hiệu dò mật khẩu (tầng web)',
+  },
+  CSRF_BLOCKED: {
+    score: 70,
+    label: 'CSRF bị chặn',
+    hint: 'Request ghi dữ liệu không có CSRF token hợp lệ hoặc gửi dạng form — có thể là trang khác giả mạo request (tầng web)',
+  },
   AFTER_HOURS: {
     score: 40,
     label: 'Truy cập ngoài giờ',
@@ -46,6 +58,10 @@ export const RULE_CODES = Object.keys(RULES);
 // Tài khoản kết nối chung của ứng dụng. Cảnh báo mang tên này là câu lệnh
 // chạy trước khi SET ROLE (chưa quy được về nhân viên nào).
 export const SESSION_USER = 'app_user';
+
+// db_user cua canh bao tu tang web: chua xac dinh duoc nhan vien (dang nhap
+// chua thanh cong, hoac request CSRF mang cookie cua nan nhan).
+export const WEB_ACTOR = 'web';
 
 export function ruleLabel(code) {
   return RULES[code]?.label ?? code;

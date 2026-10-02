@@ -1,6 +1,7 @@
 const express = require('express');
 const requireAuth = require('../middleware/requireAuth');
 const setRoleTransaction = require('../middleware/setRole');
+const { serverError } = require('../errors');
 
 const router = express.Router();
 
@@ -24,7 +25,7 @@ router.get('/', async (req, res) => {
     );
     res.json({ status: 'ok', count: result.rows.length, orders: result.rows });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    serverError(res, err, 'GET /orders');
   }
 });
 
@@ -84,7 +85,7 @@ router.post('/', async (req, res) => {
     );
     res.status(201).json({ status: 'ok', order: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    serverError(res, err, 'POST /orders');
   }
 });
 

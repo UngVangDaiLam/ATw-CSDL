@@ -24,9 +24,10 @@ const config = require('./config');
 const SessionTracker = require('./sessions');
 const AlertWriter = require('./alerts');
 const { readJsonLog, listJsonLogs } = require('./logReader');
+const { listAppLogs, evaluateAppEvent } = require('./appEvents');
 const {
   evaluate, isLocalSocket, printAlert, loadState, saveState,
-  activeWatcher, describeWatcher, parseSince, fileMayContainSince, recordAtOrAfter,
+  activeWatcher, describeWatcher, parseSince, fileMayContainSince, timestampAfter,
 } = require('./pipeline');
 
 const MAX_ALERTS_PER_RUN = 2000;
@@ -44,6 +45,7 @@ function parseArgs(argv) {
     watch: argv.includes('--watch'),
     intervalMs: value('interval') ? Number(value('interval')) : undefined,
     since: value('since'),
+    replayAfter: value('replay-after'),
   };
 }
 
@@ -65,6 +67,33 @@ async function main() {
     }
   }
 
+  // --replay-after: GHI BU canh bao sau PITR (backup/scripts/pitr_restore.sh).
+  //
+  // PITR quay lui ca bang audit.alerts: canh bao cua cac su kien sau moc khoi
+  // phuc bien mat khoi DB, trong khi file trang thai van ghi la "da xu ly" nen
+  // khong ai ghi lai - khoi phuc de go hau qua mot vu tan cong thi chinh canh
+  // bao ve vu do cung mat (da tai hien). Log pgAudit thi van con nguyen.
+  //
+  // Moc dung la `thoi_diem` LON NHAT trong cac canh bao con lai sau khoi phuc
+  // (pitr_restore.sh tu tinh bang superuser): su kien toi moc do da co canh
+  // bao, su kien SAU moc (so sanh nghiem ngat) thi chua. Doc lai tu dau cac
+  // file, chi danh gia cau lenh sau moc, ghi canh bao, roi dat vi tri da doc ve
+  // CUOI log de watch chay tiep khong trung.
+  //
+  // Gioi han: watch ghi theo tung nhip, mot cau lenh dang gom do cua phien nay
+  // co the duoc ghi SAU cau lenh moi hon cua phien khac. Neu moc khoi phuc roi
+  // dung vao khe mot nhip (~2 s) do thi cau lenh cu hon co the bi sot.
+  let replay = null;
+  if (args.replayAfter !== undefined) {
+    replay = parseSince(args.replayAfter);
+    if (!replay || since) {
+      console.error(`--replay-after phai co dang "YYYY-MM-DD HH:MM:SS[.mmm]" theo gio VN va khong dung cung --since, nhan: "${args.replayAfter}"`);
+      process.exit(1);
+    }
+  }
+  // Khoang thoi gian can danh gia (null = binh thuong, doc tiep tu file trang thai).
+  const window = since ? { from: since, exclusive: false } : replay ? { from: replay, exclusive: true } : null;
+
   // Watch dang song thi no da/se xu ly dung doan log nay - ghi them la trung.
   // --dry-run khong ghi gi nen van cho chay (scripts/verify.sh dung).
   if (!args.dryRun) {
@@ -76,6 +105,7 @@ async function main() {
     }
   }
 
+  // --replay-after van nap file trang thai THAT de cap nhat no ve cuoi log.
   const state = loadState(config.stateFile, args.all || Boolean(since));
 
   const files = listJsonLogs(config.logDir);
@@ -86,10 +116,11 @@ async function main() {
   }
 
   const alerts = [];
-  const counters = { lines: 0, statements: 0, skippedLocal: 0 };
+  const counters = { lines: 0, statements: 0, skippedLocal: 0, appEvents: 0 };
   let capReached = false;
 
   const tracker = new SessionTracker((stmt) => {
+    if (window && !timestampAfter(stmt.timestamp, window.from, window.exclusive)) return;
     counters.statements += 1;
 
     if (isLocalSocket(stmt)) {
@@ -106,15 +137,17 @@ async function main() {
 
   for (const file of files) {
     if (capReached) break;   // giu nguyen trang thai cac file con lai
-    if (since && !fileMayContainSince(file, since)) continue;
+    // File sua lan cuoi truoc moc thi khong co cau lenh nao sau moc.
+    if (window && !fileMayContainSince(file, window.from)) continue;
 
     const name = path.basename(file);
-    const already = state.files[name]?.lines || 0;
+    // Co moc thoi gian: doc tu dau file (de bam duoc SET ROLE truoc moc), loc
+    // o cap cau lenh trong callback tren. Khong co moc: doc tiep tu trang thai.
+    const already = window ? 0 : (state.files[name]?.lines || 0);
     let lastLine = already;
 
     for await (const { lineNo, record } of readJsonLog(file, already)) {
       lastLine = lineNo;
-      if (since && !recordAtOrAfter(record, since)) continue;
       counters.lines += 1;
       tracker.feed(record);
       if (capReached) break;
@@ -122,6 +155,28 @@ async function main() {
     tracker.flushAll();
 
     state.files[name] = { lines: lastLine };
+  }
+
+  // Su kien bao mat o tang web (app/src/securityLog.js) - xem src/appEvents.js.
+  // Khoa trong file trang thai co tien to "app/" de khong trung ten voi log
+  // PostgreSQL.
+  for (const file of listAppLogs(config.appLogDir)) {
+    if (capReached) break;
+    if (window && !fileMayContainSince(file, window.from)) continue;
+    const key = `app/${path.basename(file)}`;
+    const already = window ? 0 : (state.files[key]?.lines || 0);
+    let lastLine = already;
+    for await (const { lineNo, record } of readJsonLog(file, already)) {
+      if (alerts.length >= MAX_ALERTS_PER_RUN) {
+        capReached = true;
+        break;   // lastLine van la dong truoc - dong nay doc lai o lan sau
+      }
+      lastLine = lineNo;
+      counters.appEvents += 1;
+      if (window && !timestampAfter(record.ts, window.from, window.exclusive)) continue;
+      alerts.push(...evaluateAppEvent(record));
+    }
+    state.files[key] = { lines: lastLine };
   }
 
   // In ket qua ra console (de bai yeu cau co dau ra nhin thay duoc), sap theo
@@ -157,6 +212,7 @@ async function main() {
   console.log('--------------------------------------------');
   console.log(`Doc      : ${counters.lines} dong log moi, ${counters.statements} cau lenh`);
   console.log(`Bo qua   : ${counters.skippedLocal} cau lenh qua unix socket (quan tri/init)`);
+  console.log(`Tang web : ${counters.appEvents} su kien bao mat moi tu app/ (logs/app)`);
   console.log(`Canh bao : ${sorted.length}`);
   for (const [rule, n] of Object.entries(byRule).sort((a, b) => b[1] - a[1])) {
     console.log(`           ${rule.padEnd(22)} ${n}`);

@@ -16,6 +16,10 @@ RUN npm ci --omit=dev
 COPY src ./src
 COPY --from=build /app/public ./public
 
+# Lop chan thu hai cho src/errors.js: o che do production, trang loi mac dinh
+# cua Express khong kem stack trace.
+ENV NODE_ENV=production
+
 # Ma nguon thuoc root, tien trinh chay bang user node: app bi chiem cung khong
 # sua duoc chinh code cua no.
 USER node

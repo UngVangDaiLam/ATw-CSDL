@@ -34,6 +34,7 @@ node src/index.js --watch           # theo dõi liên tục, Ctrl+C để dừng
 | `--watch` | theo dõi liên tục, xem mục bên dưới |
 | `--interval=<ms>` | chu kỳ đọc của `--watch` (mặc định 2000, hoặc `WATCH_INTERVAL_MS`) |
 | `--since="YYYY-MM-DD HH:MM:SS"` | chỉ xét log từ thời điểm đó (giờ VN), bỏ qua file trạng thái. **Bắt buộc kèm `--dry-run`** — dành cho `verify.sh` |
+| `--replay-after="YYYY-MM-DD HH:MM:SS"` | **ghi bù** cảnh báo cho các câu lệnh SAU thời điểm đó, rồi đặt vị trí đọc về cuối log. `pitr_restore.sh` tự gọi sau khi khôi phục — xem bên dưới |
 
 Mã thoát: `0` xong, `1` lỗi, `3` = đang có `--watch` chạy nên lần batch này
 **nhường, không ghi** (xem "Không chạy song song" bên dưới).
@@ -82,6 +83,20 @@ không ghi gì nên vẫn chạy được.
 `verify.sh` dùng `--dry-run --since=<mốc lấy từ database>` thay vì đọc tiếp
 từ file trạng thái: nếu không, một watch đang chạy có thể đã lưu vị trí vượt
 qua các câu tấn công mà verify vừa tạo, và dry-run không thấy gì.
+
+**Sau PITR: ghi bù bằng `--replay-after`.** PITR quay lui cả `audit.alerts`,
+nhưng file trạng thái (ngoài DB) vẫn ghi là "đã xử lý" — cảnh báo của các sự
+kiện sau mốc khôi phục mất hẳn dù log còn nguyên. `pitr_restore.sh` tạm dừng
+analyzer, khôi phục, lấy `thoi_diem` lớn nhất trong các cảnh báo **còn lại**
+(superuser đọc), rồi gọi `--replay-after` với mốc đó: sự kiện tới mốc đã có
+cảnh báo, sự kiện sau mốc (so sánh nghiêm ngặt) thì chưa. Đã thử: 12 cảnh báo
+bị quay lui được ghi lại đúng, không trùng dòng nào. Giới hạn: một câu lệnh
+đang gom dở có thể được ghi sau câu mới hơn của phiên khác (lệch tối đa một
+nhịp ~2 s); mốc khôi phục rơi đúng vào khe đó thì câu cũ hơn có thể bị sót.
+
+Lọc theo thời gian (`--since`, `--replay-after`) làm ở cấp **câu lệnh**, không
+ở cấp dòng log: mọi dòng vẫn qua `SessionTracker`, nếu không dòng `SET ROLE`
+nằm ngay trước mốc bị bỏ và câu sau mốc bị quy nhầm cho `app_user`.
 
 **Giới hạn:** vai đã `SET ROLE` của một phiên chỉ nằm trong bộ nhớ. Khởi động
 lại watch giữa chừng một phiên đang mở thì các câu sau đó của phiên ấy bị quy
@@ -150,6 +165,22 @@ cùng `statement_id` — cũng phải gom lại, nếu không sẽ đếm trùng
 | `SQLI_SCHEMA_PROBE` | 70 | truy vấn `pg_catalog` / `information_schema` từ phiên ứng dụng |
 | `FULL_TABLE_READ` | 60 | `SELECT` trên bảng nhạy cảm mà không có `WHERE` |
 | `AFTER_HOURS` | 40 | chạm dữ liệu ngoài 7h–19h hoặc cuối tuần |
+| `LOGIN_BRUTE_FORCE` | 80–90 | **tầng web:** đăng nhập sai tới mức bị khóa tạm (90 nếu khóa cả IP) |
+| `CSRF_BLOCKED` | 50–70 | **tầng web:** request ghi bị chặn vì gửi dạng form (70) hoặc thiếu/sai CSRF token (50) |
+
+### Hai rule cuối đến từ tầng web, không từ log pgAudit
+
+Ở tầng database, một lần đăng nhập sai trông y hệt lần đăng nhập đúng (cùng
+câu `SELECT` trên `app.staff`), còn request CSRF bị chặn thì không tới DB. Vì
+vậy `app/src/securityLog.js` ghi các sự kiện này ra `logs/app/security-*.jsonl`
+và `src/appEvents.js` biến chúng thành cảnh báo. Cảnh báo mang `db_user = web`
+(chưa xác định được nhân viên). App **không** được ghi thẳng vào
+`audit.alerts`: `app_user` cố ý không có quyền gì trên schema `audit`.
+
+Nội dung file là **dữ liệu không tin cậy** — app bị chiếm thì ghi được bất cứ
+gì: kiểm tra kiểu từng trường, cắt ngắn, che chuỗi số dài, sự kiện lạ bị bỏ
+qua. Giới hạn: app bị chiếm cũng có thể im lặng hoặc ghi sự kiện giả — nguồn
+này bổ sung cho log pgAudit, không thay thế.
 
 Một câu lệnh có thể kích hoạt **nhiều rule cùng lúc**, và đó là chủ đích: một
 câu `UNION SELECT` đọc `app.staff` lúc 2 giờ sáng sinh ra ba cảnh báo độc lập.

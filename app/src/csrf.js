@@ -18,6 +18,7 @@
 // vao tai khoan cua ke tan cong, roi doc duoc nhung gi nan nhan nhap vao).
 
 const crypto = require('crypto');
+const { securityEvent, clip } = require('./securityLog');
 
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -35,6 +36,9 @@ function sameToken(a, b) {
 
 function requireJson(req, res, next) {
   if (UNSAFE.has(req.method) && !req.is('application/json')) {
+    // Client that cua app luon gui JSON - request ghi dang form la dau hieu ro
+    // cua CSRF tu trang khac. Ghi cho lop 3 (src/securityLog.js).
+    securityEvent('csrf_rejected', req, { reason: 'content_type', content_type: clip(req.get('Content-Type'), 100) });
     return res.status(415).json({ status: 'error', message: 'Chi nhan Content-Type: application/json' });
   }
   next();
@@ -45,6 +49,9 @@ function verifyCsrf(req, res, next) {
   const expected = req.session && req.session.csrf;
   const got = req.get('X-CSRF-Token');
   if (!expected || !got || !sameToken(expected, got)) {
+    // Thieu/sai token: co the la CSRF, cung co the chi la token het han (phien
+    // vua duoc cap lai o tab khac) - lop 3 cham diem thap hon truong hop tren.
+    securityEvent('csrf_rejected', req, { reason: got ? 'token_mismatch' : 'token_missing' });
     return res.status(403).json({ status: 'error', message: 'Thieu hoac sai CSRF token - lay token qua GET /auth/csrf' });
   }
   next();

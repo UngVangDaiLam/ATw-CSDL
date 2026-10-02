@@ -25,6 +25,16 @@ function toClient(row) {
   return { ...row, created_at: row.created_at?.toISOString?.() ?? row.created_at };
 }
 
+// Database dang replay WAL (PITR, xem backup/scripts/pitr_restore.sh) van cho
+// DOC (hot standby), nhung du lieu luc do la trang thai DO DANG cua qua trinh
+// khoi phuc. Doc trung luc ay, dashboard tuong bang bi lam lai (max id tut ve
+// vai tram), keo con tro lui, roi khi khoi phuc xong day lai hang tram canh bao
+// CU xuong trinh duyet nhu canh bao moi (da tai hien: 409 canh bao "moi").
+export async function inRecovery() {
+  const { rows } = await pool.query('SELECT pg_is_in_recovery() AS r');
+  return rows[0].r === true;
+}
+
 export async function latestAlerts(limit) {
   const { rows } = await pool.query(
     `SELECT ${COLUMNS} FROM audit.alerts ORDER BY id DESC LIMIT $1`,

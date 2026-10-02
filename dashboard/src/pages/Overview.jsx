@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import Icon from '../components/Icon.jsx';
 import { Card, EmptyState, RiskBadge, UserChip } from '../components/common.jsx';
-import { LEVELS, RULES, SESSION_USER, levelOf, ruleLabel, timeAgo } from '../lib/alerts.js';
+import { LEVELS, RULES, SESSION_USER, WEB_ACTOR, levelOf, ruleLabel, timeAgo } from '../lib/alerts.js';
 
 function Kpi({ icon, label, value, tone, foot }) {
   return (
@@ -118,7 +118,8 @@ export default function Overview({ stats, alerts, onOpen, onFilterRule, onFilter
   const users = stats?.by_user ?? [];
   // Cảnh báo mang tên tài khoản kết nối (app_user) là câu lệnh chạy TRƯỚC khi
   // SET ROLE — chưa quy được cho nhân viên nào, nên không đếm là "nhân viên".
-  const staff = users.filter((u) => u.db_user !== SESSION_USER);
+  // Canh bao tu tang web (WEB_ACTOR) cung chua quy duoc cho nhan vien nao.
+  const staff = users.filter((u) => u.db_user !== SESSION_USER && u.db_user !== WEB_ACTOR);
 
   return (
     <div className="page">
@@ -153,6 +154,7 @@ export default function Overview({ stats, alerts, onOpen, onFilterRule, onFilter
                   <span className="muted small">
                     {u.n} cảnh báo
                     {u.db_user === SESSION_USER && <span className="pre-role"> · trước khi SET ROLE</span>}
+                    {u.db_user === WEB_ACTOR && <span className="pre-role"> · tầng web, chưa rõ nhân viên</span>}
                   </span>
                   <span className="user-max">cao nhất <RiskBadge score={u.max_risk} size="sm" /></span>
                 </button>

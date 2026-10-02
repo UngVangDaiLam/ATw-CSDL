@@ -311,6 +311,8 @@ expect "app trong container ket noi database bang app_user" '"current_user":"app
 
 # -----------------------------------------------------------------------------
 section "WEB - lop bao ve tang HTTP cua app/"
+# Moc thoi gian cho phan "su kien tang web -> lop 3" o cuoi muc nay.
+WEB_SINCE="$(sql_su "SELECT to_char(now() AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD HH24:MI:SS.MS');")"
 # Khoa ky cookie phien: thieu, dung gia tri mau hoac qua ngan thi app tu choi
 # khoi dong (ban goc am tham dung khoa mac dinh viet thang trong code).
 # Container tam chay thang tu image, KHONG mang (--network none): app phai dung
@@ -375,7 +377,10 @@ rm -f "$JAR"
 # tai: khoa theo cap, khoa nham hn01 thi demo-attack.sh va chinh verify.sh
 # khong dang nhap duoc trong 15 phut.
 JAR="$(mktemp)"
-BF_USER="verify_bf_$RANDOM$RANDOM"
+# Chen chu "x" giua: hai $RANDOM lien nhau co the thanh day >= 9 chu so, ma
+# analyzer CHE moi day so nhu vay trong canh bao (chong lo CCCD) - phep thu
+# ben duoi se khong tim thay username nua.
+BF_USER="verify_bf_${RANDOM}x${RANDOM}"
 BF_TOKEN="$(curl -s -c "$JAR" -b "$JAR" "$WEB/auth/csrf" | grep -o '"csrfToken":"[0-9a-f]*"' | cut -d'"' -f4)"
 bf_try() {
     curl -s -D - -o /dev/null -c "$JAR" -b "$JAR" -X POST "$WEB/auth/login" -H 'Content-Type: application/json' \
@@ -393,6 +398,50 @@ else bad "5 lan dang nhap sai -> lan thu 6 bi khoa (429 + Retry-After)" "401 x5 
 expect "khoa chi ap cho username bi do - tai khoan khac van dang nhap duoc" " 200" \
        "$(bf_try hn01 Demo@123456 | head -1)"
 rm -f "$JAR"
+
+# Loi KHONG lo chi tiet noi bo (app/src/errors.js).
+# JSON hong: truoc day Express tra nguyen stack trace kem /app/node_modules/...
+BAD_JSON="$(curl -s -w ' HTTP%{http_code}' -X POST "$WEB/auth/login" -H 'Content-Type: application/json' -d '{"username": hn01')"
+if printf '%s' "$BAD_JSON" | grep -q 'HTTP400$' && ! printf '%s' "$BAD_JSON" | grep -qiE 'SyntaxError|node_modules|at JSON'; then
+    ok "JSON hong -> 400, KHONG lo stack trace"
+else bad "JSON hong -> 400, KHONG lo stack trace" "HTTP400, khong co SyntaxError/node_modules" "$(printf '%s' "$BAD_JSON" | cut -c1-120)"; fi
+
+# Loi tu PostgreSQL tren route binh thuong: client chi thay ma tham chieu, chi
+# tiet (ten rang buoc...) chi nam trong log server. Tao don cho khach hang
+# KHONG ton tai -> vi pham khoa ngoai; INSERT that bai, transaction ROLLBACK,
+# khong de lai du lieu.
+JAR="$(mktemp)"
+E_TOKEN="$(curl -s -c "$JAR" -b "$JAR" "$WEB/auth/csrf" | grep -o '"csrfToken":"[0-9a-f]*"' | cut -d'"' -f4)"
+E_TOKEN="$(curl -s -c "$JAR" -b "$JAR" -X POST "$WEB/auth/login" -H 'Content-Type: application/json' -H "X-CSRF-Token: $E_TOKEN" \
+             -d '{"username":"hn01","password":"Demo@123456"}' | grep -o '"csrfToken":"[0-9a-f]*"' | cut -d'"' -f4)"
+DB_ERR="$(curl -s -b "$JAR" -X POST "$WEB/orders" -H 'Content-Type: application/json' -H "X-CSRF-Token: $E_TOKEN" \
+             -d '{"customer_id":999999999,"total_amount":1000}')"
+ERR_REF="$(printf '%s' "$DB_ERR" | grep -o '"ref":"[0-9a-f]*"' | cut -d'"' -f4)"
+if [ -n "$ERR_REF" ] && ! printf '%s' "$DB_ERR" | grep -qiE 'constraint|violates|foreign key|orders_'; then
+    ok "loi CSDL tra ve ma tham chieu, KHONG lo ten bang/rang buoc"
+else bad "loi CSDL tra ve ma tham chieu, KHONG lo ten bang/rang buoc" "{ref, thong bao chung}" "$(printf '%s' "$DB_ERR" | cut -c1-120)"; fi
+if [ -n "$ERR_REF" ] && docker compose logs --no-log-prefix app 2>/dev/null | grep -q "\[loi $ERR_REF\].*foreign key"; then
+    ok "chi tiet loi nam trong log server, tra duoc bang ma tham chieu"
+else bad "chi tiet loi nam trong log server, tra duoc bang ma tham chieu" "[loi $ERR_REF] ... foreign key" "khong thay trong docker compose logs app"; fi
+rm -f "$JAR"
+
+# Su kien tang web -> lop 3. Cac phep thu o tren vua gay ra mot lan khoa dang
+# nhap ($BF_USER) va vai request CSRF bi chan - log pgAudit khong the hien
+# nhung thu nay. app ghi chung ra logs/app/ (app/src/securityLog.js), analyzer
+# doc va bien thanh canh bao (analyzer/src/appEvents.js). app_user van KHONG co
+# quyen gi tren schema audit (phep thu o muc LOP 1).
+sleep 1
+if grep -h "\"username\":\"$BF_USER\"" logs/app/security-*.jsonl 2>/dev/null | grep -q '"event":"login_locked"'; then
+    ok "app ghi su kien 'bi khoa vi do mat khau' ra logs/app/ (khong ghi mat khau)"
+else bad "app ghi su kien 'bi khoa vi do mat khau' ra logs/app/ (khong ghi mat khau)" "login_locked cho $BF_USER" "khong thay trong logs/app/security-*.jsonl"; fi
+if [ -n "${ANALYZER_SKIP:-}" ]; then
+    printf '  \033[33mBO QUA\033[0m analyzer khong chay duoc: %s\n' "$ANALYZER_SKIP"
+else
+    WEB_ALERTS="$("${ANALYZER_CMD[@]}" --dry-run --since="$WEB_SINCE" 2>&1)"
+    expect "analyzer bien do mat khau thanh canh bao LOGIN_BRUTE_FORCE" "$BF_USER" \
+           "$(printf '%s' "$WEB_ALERTS" | grep -A1 'LOGIN_BRUTE_FORCE')"
+    expect "analyzer bien request CSRF bi chan thanh canh bao CSRF_BLOCKED" "CSRF_BLOCKED" "$WEB_ALERTS"
+fi
 
 # Giao dien web (app/web -> public/) phuc vu cung origin voi API, va cung mang
 # CSP nhu moi phan hoi khac.

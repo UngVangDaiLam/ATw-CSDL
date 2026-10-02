@@ -24,6 +24,7 @@
 // Middleware nay PHAI dat SAU requireAuth trong chuoi middleware (can
 // req.session.staff.db_user da duoc dang nhap set san).
 const pool = require('../db');
+const { serverError } = require('../errors');
 
 const DB_USER_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -43,7 +44,7 @@ async function setRoleTransaction(req, res, next) {
     req.dbClient = client;
   } catch (err) {
     if (client) client.release();
-    return res.status(500).json({ status: 'error', message: err.message });
+    return serverError(res, err, 'SET LOCAL ROLE');
   }
 
   res.on('finish', () => {

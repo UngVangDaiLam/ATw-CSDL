@@ -17,6 +17,14 @@
 #      giải nén base backup, kiểm tra với backup_manifest, ghi cấu hình recovery
 #   5. khởi động postgres -> tự replay WAL từ archive tới thời điểm đích -> promote
 #   6. xóa cấu hình recovery khỏi postgresql.auto.conf
+#   7. analyzer ghi bù cảnh báo của các sự kiện sau mốc khôi phục
+#
+# VÌ SAO CÓ BƯỚC 7: PITR quay lui cả bảng audit.alerts, nhưng file trạng thái
+# của analyzer (analyzer/state/, nằm ngoài DB) vẫn ghi là "đã xử lý" - không ai
+# ghi lại các cảnh báo đó. Khôi phục để gỡ hậu quả một vụ tấn công thì chính
+# cảnh báo về vụ đó cũng mất (đã tái hiện). Log pgAudit thì vẫn còn nguyên, nên
+# analyzer phân tích lại được. Analyzer được TẠM DỪNG suốt quá trình khôi phục
+# để không đọc log / lưu trạng thái lẫn vào giữa.
 #
 # Sau khi promote, cluster sang TIMELINE mới (00000002..., 00000003...). WAL
 # của timeline cũ trong kho archive vẫn giữ nguyên và không bị ghi đè vì khác
@@ -71,16 +79,28 @@ if [ -z "$YES" ]; then
     fi
 fi
 
-echo "==> [1/5] Day WAL con lai ra kho archive"
+echo "==> [1/6] Day WAL con lai ra kho archive"
 echo "    segment cuoi: $(flush_wal)"
 
-echo "==> [2/5] Dung postgres"
+# Tạm dừng analyzer trong Docker (nếu đang chạy) - bật lại ở cuối.
+ANALYZER_WAS_UP=""
+if docker compose ps --status running --services 2>/dev/null | grep -qx analyzer; then
+    ANALYZER_WAS_UP=1
+fi
+restart_analyzer() {
+    if [ -n "$ANALYZER_WAS_UP" ]; then docker compose start analyzer >/dev/null 2>&1 || true; fi
+}
+# Hỏng giữa chừng cũng phải bật lại analyzer.
+trap restart_analyzer EXIT
+
+echo "==> [2/6] Dung analyzer (neu co) va postgres"
+[ -n "$ANALYZER_WAS_UP" ] && docker compose stop analyzer
 docker compose stop postgres
 
-echo "==> [3/5] Dung lai data directory tu base backup"
+echo "==> [3/6] Dung lai data directory tu base backup"
 docker compose run --rm -T pitr-restore -s -- live "$BASE" "$TARGET" < backup/scripts/_restore_inner.sh
 
-echo "==> [4/5] Khoi dong postgres - replay WAL toi $TARGET_SHOW"
+echo "==> [4/6] Khoi dong postgres - replay WAL toi $TARGET_SHOW"
 docker compose up -d postgres
 DONE=""
 for _ in $(seq 1 90); do
@@ -93,7 +113,7 @@ if [ -z "$DONE" ]; then
     exit 1
 fi
 
-echo "==> [5/5] Xoa cau hinh recovery khoi postgresql.auto.conf"
+echo "==> [5/6] Xoa cau hinh recovery khoi postgresql.auto.conf"
 # Để lại thì vô hại lúc này (recovery.signal đã bị xóa khi promote), nhưng
 # lần PITR sau sẽ ghi chồng thêm một bộ tham số nữa vào cùng file.
 _su "ALTER SYSTEM RESET restore_command;" >/dev/null
@@ -106,6 +126,24 @@ for _ in $(seq 1 30); do
     docker compose exec -T postgres pg_isready -h 172.28.0.10 -p 5432 -q 2>/dev/null && break
     sleep 1
 done
+
+echo "==> [6/6] Ghi bu canh bao cua cac su kien sau moc khoi phuc"
+# Mốc = thoi_diem lớn nhất trong các cảnh báo CÒN LẠI sau khôi phục (chỉ
+# superuser đọc được; analyzer_user không có SELECT). Sự kiện tới mốc đó đã có
+# cảnh báo, sự kiện sau mốc thì chưa - xem analyzer/src/index.js --replay-after.
+SINCE_ALERT=$(_su "SELECT coalesce(max(left(detail->>'thoi_diem', 23)), '1970-01-01 00:00:00.000') FROM audit.alerts;")
+echo "    canh bao moi nhat con lai: $SINCE_ALERT"
+if docker compose config --services 2>/dev/null | grep -qx analyzer; then
+    # Container tạm từ image analyzer (cùng volume log + trạng thái). Service
+    # analyzer đang dừng nên không đụng IP cố định của nó.
+    docker compose run --rm --no-deps -T analyzer node src/index.js --replay-after="$SINCE_ALERT" --quiet         | sed 's/^/    /' || echo "    CANH BAO: ghi bu that bai - chay tay lenh tren sau"
+elif [ -d analyzer/node_modules ] && [ -f analyzer/.env ]; then
+    (cd analyzer && node src/index.js --replay-after="$SINCE_ALERT" --quiet) | sed 's/^/    /'         || echo "    CANH BAO: ghi bu that bai"
+else
+    echo "    Bo qua: khong co analyzer. Chay sau: node src/index.js --replay-after=\"$SINCE_ALERT\""
+fi
+restart_analyzer
+trap - EXIT
 
 echo "==> Xong. Da khoi phuc ve $TARGET_SHOW"
 echo "    Timeline moi : $(timeline)"

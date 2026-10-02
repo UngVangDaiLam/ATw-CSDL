@@ -149,8 +149,13 @@ services:
       # Khoa ky cookie phien: Docker secret (file), KHONG phai bien moi truong.
       SESSION_SECRET_FILE: /run/secrets/session_secret
       PORT: 3000
+      # Su kien bao mat tang web (do mat khau bi khoa, CSRF bi chan) - analyzer
+      # doc thu muc nay (chi doc) va ghi canh bao. Xem app/src/securityLog.js.
+      APP_LOG_DIR: /var/log/app
     secrets:
       - session_secret
+    volumes:
+      - ./logs/app:/var/log/app
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-3000}:3000"
     depends_on:
@@ -180,6 +185,8 @@ services:
       DB_USER: analyzer_user
       DB_PASSWORD: ${ANALYZER_PASSWORD}
       LOG_DIR: /logs
+      # logs/app/ nam trong ./logs da mount CHI DOC o duoi.
+      APP_LOG_DIR: /logs/app
       STATE_FILE: /state/analyzer-state.json
     volumes:
       # Log là BẰNG CHỨNG: mount chỉ đọc, analyzer bị chiếm cũng không sửa/xóa

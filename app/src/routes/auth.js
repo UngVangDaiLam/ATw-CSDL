@@ -3,6 +3,8 @@ const bcrypt = require('bcryptjs');
 const pool = require('../db');
 const { issueCsrfToken } = require('../csrf');
 const limiter = require('../loginLimiter');
+const { securityEvent, clip } = require('../securityLog');
+const { serverError } = require('../errors');
 
 const router = express.Router();
 
@@ -42,7 +44,17 @@ router.post('/login', async (req, res) => {
     const staff = result.rows[0];
     const ok = await bcrypt.compare(String(password), staff?.password_hash || DUMMY_HASH);
     if (!staff || !staff.password_hash || !ok) {
-      limiter.recordFailure(req.ip, username);
+      const lock = limiter.recordFailure(req.ip, username);
+      // Vua bi khoa: ghi MOT su kien cho lop 3 (src/securityLog.js). Khong ghi
+      // mat khau; username la du lieu nguoi dung go vao - cat ngan.
+      if (lock.justLocked) {
+        securityEvent('login_locked', req, {
+          username: clip(username),
+          lock_scope: lock.justLocked,
+          failures: lock.failures,
+          retry_after_s: lock.retryAfter,
+        });
+      }
       return res.status(401).json({ status: 'error', message: 'Sai username hoac password' });
     }
     limiter.recordSuccess(req.ip, username);
@@ -68,7 +80,7 @@ router.post('/login', async (req, res) => {
       res.json({ status: 'ok', staff: req.session.staff, csrfToken: issueCsrfToken(req) });
     });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    serverError(res, err, 'POST /auth/login');
   }
 });
 

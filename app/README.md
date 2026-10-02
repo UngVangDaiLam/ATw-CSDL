@@ -224,6 +224,33 @@ Mỗi lần chạy `verify.sh` cộng 5 lần sai vào ngưỡng theo IP của m
 một username ngẫu nhiên) — chạy liên tục hơn 20 lần trong 15 phút thì máy host
 bị khóa đăng nhập; restart app để gỡ.
 
+### Thông báo lỗi không lộ chi tiết nội bộ (`src/errors.js`)
+
+Trước đây lỗi 500 trả nguyên thông báo của PostgreSQL (tên bảng, tên cột, tên
+ràng buộc — đủ để vẽ lại sơ đồ CSDL), còn JSON hỏng thì Express trả **nguyên
+stack trace** kèm đường dẫn `/app/node_modules/...`. Giờ:
+
+| Trường hợp | Client nhận |
+|---|---|
+| Lỗi CSDL / lỗi không lường trước | `500` + `Loi may chu. Ma tham chieu: 46c0d919` |
+| Body không phải JSON hợp lệ | `400` thông báo ngắn |
+| Body quá 10 KB | `413` |
+| Route không tồn tại | `404` JSON |
+
+Chi tiết đầy đủ ghi vào log server cùng mã tham chiếu — tra bằng
+`docker compose logs app | grep 46c0d919`. Image chạy với `NODE_ENV=production`
+làm lớp chặn thứ hai. **Hai endpoint cố ý vẫn trả nguyên lỗi PostgreSQL** (giữ
+đúng cách viết ban đầu).
+
+### Sự kiện bảo mật lên dashboard (`src/securityLog.js`)
+
+Bị khóa vì dò mật khẩu và request bị chặn vì CSRF không để lại dấu vết gì
+trong log pgAudit. App ghi chúng ra `logs/app/security-YYYY-MM-DD.jsonl`
+(không ghi mật khẩu; username cắt còn 64 ký tự); analyzer đọc **chỉ đọc** và
+ghi cảnh báo `LOGIN_BRUTE_FORCE` / `CSRF_BLOCKED` bằng `analyzer_user` — hiện
+trên dashboard sau 1–4 giây. App vẫn **không có quyền gì** trên `audit.alerts`.
+Mỗi lần khóa chỉ ghi **một** sự kiện, không ghi lặp mỗi lần bị từ chối.
+
 Không biện pháp nào ở đây vá được 2 lỗ hổng cố ý: SQLi là lỗi nối chuỗi trong
 truy vấn, IDOR là thiếu kiểm tra quyền — không header hay cờ cookie nào chặn
 được. Bảo vệ tầng web không thay được việc viết code đúng.

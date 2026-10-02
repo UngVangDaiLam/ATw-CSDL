@@ -7,6 +7,7 @@ const authRoutes = require('./routes/auth');
 const customerRoutes = require('./routes/customers');
 const orderRoutes = require('./routes/orders');
 const { loadSessionSecret } = require('./sessionSecret');
+const { serverError, notFound, errorHandler } = require('./errors');
 
 let sessionSecret;
 try {
@@ -56,7 +57,7 @@ app.get('/health', async (req, res) => {
     );
     res.json({ status: 'ok', ...result.rows[0] });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    serverError(res, err, 'GET /health');
   }
 });
 
@@ -80,5 +81,11 @@ if (fs.existsSync(path.join(publicDir, 'index.html'))) {
     res.type('text').send('Chua build giao dien. Chay: npm run build (hoac docker compose up -d --build app)')
   );
 }
+
+// Phai dat CUOI CUNG: route khong ton tai, roi moi loi chua ai bat (ke ca JSON
+// hong tu express.json) - khong de Express tra trang loi mac dinh kem stack
+// trace. Xem src/errors.js.
+app.use(notFound);
+app.use(errorHandler);
 
 module.exports = app;

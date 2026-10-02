@@ -17,7 +17,7 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 | 3 | `pgAudit` + analyzer tự viết | **Xong** (6 rule, ghi `audit.alerts` bằng `analyzer_user`) |
 | 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (83 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (89 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -326,6 +326,15 @@ này. Đọc `app/README.md` trước khi sửa — dưới đây chỉ là ph�
   (`src/csrf.js`). Lấy token qua `GET /auth/csrf`; đăng nhập trả token mới vì
   phiên được cấp lại. Script hay client mới gọi app phải theo luồng này (xem
   `demo-attack.sh`). Đừng thêm ngoại lệ "cho tiện test".
+- **Lỗi 500 dùng `serverError()` của `src/errors.js`, không trả `err.message`.**
+  Client chỉ nhận mã tham chiếu; chi tiết vào log server. Ngoại lệ DUY NHẤT là 2
+  endpoint cố ý (`/customers/search`, `/orders/:id`) — giữ nguyên cách viết gốc.
+  `notFound` + `errorHandler` phải là middleware CUỐI CÙNG trong `app.js`.
+- **Sự kiện bảo mật tầng web đi qua FILE, không qua DB:** `src/securityLog.js`
+  ghi `logs/app/*.jsonl`, analyzer (`src/appEvents.js`) đọc và ghi cảnh báo.
+  Đừng "đơn giản hóa" bằng cách cấp `INSERT audit.alerts` cho `app_user` — phá
+  nguyên tắc app bị chiếm không chạm được bằng chứng. Analyzer coi file này là
+  dữ liệu không tin cậy (kiểm kiểu, cắt ngắn, che số, whitelist tên sự kiện).
 - **Giới hạn đăng nhập sai ở `src/loginLimiter.js`** (5 lần/cặp IP+username,
   100 lần/IP, cửa sổ 15 phút, bộ đếm trong bộ nhớ). Phép thử phải dùng
   username ngẫu nhiên không tồn tại — khóa nhầm `hn01` là demo hỏng 15 phút.
@@ -482,6 +491,14 @@ Xem mục 7c trong `README.md`. Phần dễ sai:
   thông thường nên KHÔNG đi vào nhánh `replication` của `pg_hba`.
 - `pitr_restore.sh` cất data cũ vào `backup/full/pre_pitr_*.tar.gz` trước khi
   ghi đè — lưới an toàn nếu chọn nhầm thời điểm.
+- **PITR quay lui cả `audit.alerts` nhưng không quay lui `analyzer/state/`.**
+  `pitr_restore.sh` tạm dừng analyzer rồi ghi bù bằng `--replay-after=<thoi_diem
+  lớn nhất còn lại>`. Đừng bỏ bước này: thiếu nó, cảnh báo về chính sự cố vừa
+  khôi phục biến mất vĩnh viễn.
+- **Dashboard không đọc DB khi `pg_is_in_recovery()`** — đang replay WAL thì DB
+  vẫn cho đọc trạng thái dở dang; đọc trúng là đẩy hàng trăm cảnh báo cũ xuống
+  trình duyệt như cảnh báo mới (đã tái hiện: 409). Kết nối lại xong thì luôn
+  phát `reset` để client tải lại toàn bộ.
 
 ## Nghiệm thu
 
@@ -489,7 +506,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 83 phép thử, phải đạt hết
+bash scripts/verify.sh         # 89 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

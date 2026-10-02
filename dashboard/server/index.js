@@ -9,7 +9,7 @@ import http from 'node:http';
 import express from 'express';
 import { Server } from 'socket.io';
 import config from './config.js';
-import { pool, latestAlerts, alertsAfter, stats, auditSettings } from './alerts.js';
+import { pool, latestAlerts, alertsAfter, stats, auditSettings, inRecovery } from './alerts.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -62,14 +62,22 @@ async function refreshStats() {
 
 // Khởi tạo (hoặc khởi tạo lại sau khi mất kết nối / reset DB).
 async function init() {
+  // Chua doc gi khi database con dang khoi phuc - xem inRecovery() o alerts.js.
+  // Nem loi de giu trang thai 'down'; nhip sau thu lai.
+  if (await inRecovery()) throw new Error('database dang khoi phuc (PITR) - cho xong moi doc');
   const s = await refreshStats();
-  // Kho cảnh báo bị làm lại từ đầu (scripts/reset.sh) -> id đánh số lại, con
-  // trỏ cũ sẽ đứng chờ mãi. Báo client tải lại toàn bộ.
-  if (state.lastId !== null && s.max_id < state.lastId) {
-    console.log(`[poll] max_id ${s.max_id} < con tro ${state.lastId}: bang da duoc lam lai`);
-    io.emit('reset');
+  // Khởi tạo LẠI sau khi mất kết nối: không biết lúc mất kết nối đã xảy ra gì -
+  // reset.sh làm lại cả bảng, PITR quay lui một phần (cảnh báo sau mốc khôi
+  // phục biến mất, id đánh lại), analyzer ghi bù... So max_id với con trỏ cũ
+  // KHÔNG đủ: ghi bù đủ nhiều thì max_id vượt con trỏ cũ dù bảng đã đổi. Nên
+  // luôn bắt client tải lại toàn bộ và đặt con trỏ theo hiện tại.
+  // Phát cả ở lần khởi tạo ĐẦU: client nào kết nối lúc DB chưa sẵn sàng (vd.
+  // ngay sau reset.sh) chưa nhận được snapshot, phải được báo để xin lại.
+  if (state.lastId !== null) {
+    console.log(`[poll] ket noi lai (max_id ${s.max_id}, con tro cu ${state.lastId}) - yeu cau client tai lai`);
   }
   state.lastId = s.max_id;
+  io.emit('reset');
   state.settings = await auditSettings().catch(() => null);
 }
 
@@ -105,6 +113,9 @@ async function poll() {
 }
 
 async function snapshot() {
+  // Đang mất kết nối hoặc DB đang khôi phục: không đưa dữ liệu dở dang cho
+  // client. Khi poll khởi tạo lại được, nó phát 'reset' và client xin lại.
+  if (state.status.db !== 'up') throw new Error(state.status.error || 'database chua san sang');
   return {
     alerts: await latestAlerts(config.initialLimit),
     stats: state.stats ?? (await refreshStats()),

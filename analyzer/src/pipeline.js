@@ -57,7 +57,8 @@ function printAlert(a) {
     `[${String(a.risk_score).padStart(2)}] ${a.rule_triggered.padEnd(22)} ${String(a.db_user).padEnd(14)} ${d.thoi_diem}`
   );
   console.log(`     ${d.mo_ta}`);
-  console.log(`     ${d.cau_lenh}`);
+  // Canh bao tu tang web (src/appEvents.js) khong co cau SQL - in duong dan HTTP.
+  console.log(`     ${d.cau_lenh ?? d.duong_dan ?? ''}`);
 }
 
 function loadState(file, ignore) {
@@ -203,12 +204,16 @@ function fileMayContainSince(filePath, since) {
   }
 }
 
-function recordAtOrAfter(record, since) {
-  return String(record.timestamp || '').slice(0, 23) >= since;
+// So timestamp cua MOT CAU LENH voi moc. Loc o cap cau lenh chu khong o cap
+// dong log: moi dong van phai qua SessionTracker, neu khong dong "SET ROLE nv_x"
+// nam ngay truoc moc se bi bo va cau lenh sau moc bi quy nham cho app_user.
+function timestampAfter(ts, since, exclusive) {
+  const t = String(ts || '').slice(0, 23);
+  return exclusive ? t > since : t >= since;
 }
 
 module.exports = {
   evaluate, isLocalSocket, printAlert, loadState, saveState,
   activeWatcher, acquireWatchLock, releaseWatchLock, heartbeat, describeWatcher,
-  parseSince, fileMayContainSince, recordAtOrAfter,
+  parseSince, fileMayContainSince, timestampAfter,
 };

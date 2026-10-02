@@ -68,6 +68,10 @@ module.exports = {
   // thu muc dang dung), nen "LOG_DIR=../logs" luon tro dung ./logs cua repo.
   // path.resolve van ton trong duong dan tuyet doi neu ai do dat kieu do.
   logDir: path.resolve(ROOT, process.env.LOG_DIR || '../logs'),
+  // Nhat ky su kien bao mat o tang web do app/ ghi (app/src/securityLog.js):
+  // do mat khau bi khoa, CSRF bi chan - nhung thu khong de lai dau vet trong
+  // log pgAudit. Xem src/appEvents.js.
+  appLogDir: path.resolve(ROOT, process.env.APP_LOG_DIR || '../logs/app'),
   stateFile: resolveStateFile(),
 
   // Bang duoc coi la nhay cam. Them bang moi vao app thi can nhac them o day.

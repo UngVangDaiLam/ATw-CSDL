@@ -46,11 +46,23 @@ function lockedFor(ip, username, now = Date.now()) {
 
 function recordFailure(ip, username, now = Date.now()) {
   const k = keysFor(ip, username);
-  for (const key of [k.user, k.ip]) {
+  const counts = {};
+  for (const [name, key] of [['user', k.user], ['ip', k.ip]]) {
     const entry = current(key, now) || { count: 0, resetAt: now + WINDOW_MS };
     entry.count += 1;
     counters.set(key, entry);
+    counts[name] = entry;
   }
+  // Bao lai DUNG LUC vua cham nguong (chuyen tu "mo" sang "khoa") de nguoi goi
+  // ghi MOT su kien cho moi lan khoa, khong ghi lap lai moi lan bi tu choi.
+  let justLocked = null;
+  if (counts.ip.count === MAX_PER_IP) justLocked = 'ip';
+  else if (counts.user.count === MAX_PER_USER) justLocked = 'user';
+  return {
+    justLocked,
+    failures: justLocked === 'ip' ? counts.ip.count : counts.user.count,
+    retryAfter: Math.ceil(((justLocked === 'ip' ? counts.ip : counts.user).resetAt - now) / 1000),
+  };
 }
 
 function recordSuccess(ip, username) {

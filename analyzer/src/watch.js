@@ -32,6 +32,7 @@ const config = require('./config');
 const SessionTracker = require('./sessions');
 const AlertWriter = require('./alerts');
 const { listJsonLogs } = require('./logReader');
+const { listAppLogs, evaluateAppEvent } = require('./appEvents');
 const { byteOffsetOfLine, readNew } = require('./tail');
 const {
   evaluate, isLocalSocket, printAlert, loadState, saveState,
@@ -83,7 +84,7 @@ async function watch(args) {
 
   const positions = new Map();   // ten file -> { offset (byte), lineNo }
   const queue = [];              // canh bao da phat hien, chua ghi duoc
-  const counters = { lines: 0, statements: 0, skippedLocal: 0, written: 0, bad: 0 };
+  const counters = { lines: 0, statements: 0, skippedLocal: 0, appEvents: 0, written: 0, bad: 0 };
 
   const tracker = new SessionTracker((stmt) => {
     counters.statements += 1;
@@ -115,44 +116,59 @@ async function watch(args) {
     shown.logs = null;
 
     for (const file of files) {
-      // Một file đọc không được (sai quyền, vừa bị xóa) không được chặn các
-      // file sau nó - nếu không thì toàn bộ log mới đều bị bỏ qua.
-      try {
-        readOne(file);
-        shown.files.delete(path.basename(file));
-      } catch (err) {
-        const name = path.basename(file);
-        const why = describe(err);
-        if (shown.files.get(name) !== why) log(`Khong doc duoc ${name}: ${why}`);
-        shown.files.set(name, why);
-      }
+      const name = path.basename(file);
+      safeRead(file, name, (lineNo, record) => {
+        counters.lines += 1;
+        tracker.feed(record, { file: name, line: lineNo });
+      });
     }
   }
 
-  function readOne(file) {
-    const name = path.basename(file);
-    let pos = positions.get(name);
+  // Su kien bao mat o tang web (app/src/securityLog.js) - xem src/appEvents.js.
+  // Moi dong la mot su kien doc lap: khong can bam phien, danh gia ngay. Khoa
+  // trong file trang thai co tien to "app/" de khong trung ten log PostgreSQL.
+  function readAppLogs() {
+    for (const file of listAppLogs(config.appLogDir)) {
+      safeRead(file, `app/${path.basename(file)}`, (lineNo, record) => {
+        counters.appEvents += 1;
+        queue.push(...evaluateAppEvent(record));
+      });
+    }
+  }
+
+  // Một file đọc không được (sai quyền, vừa bị xóa) không được chặn các file
+  // sau nó - nếu không thì toàn bộ log mới đều bị bỏ qua.
+  function safeRead(file, key, onRecord) {
+    try {
+      readOne(file, key, onRecord);
+      shown.files.delete(key);
+    } catch (err) {
+      const why = describe(err);
+      if (shown.files.get(key) !== why) log(`Khong doc duoc ${key}: ${why}`);
+      shown.files.set(key, why);
+    }
+  }
+
+  function readOne(file, key, onRecord) {
+    let pos = positions.get(key);
     if (!pos) {
       // Lan dau gap file trong tien trinh nay: tiep tuc tu cho file trang
       // thai ghi (co the do batch de lai).
-      const lines = state.files[name]?.lines || 0;
+      const lines = state.files[key]?.lines || 0;
       pos = { offset: byteOffsetOfLine(file, lines), lineNo: lines };
-      positions.set(name, pos);
+      positions.set(key, pos);
     }
     // Doc het phan moi (moi lan readNew toi da 8 MB).
     for (;;) {
       const r = readNew(file, pos.offset, pos.lineNo);
       if (r.truncated) {
-        log(`${name} ngan lai (bi lam lai?) - doc lai tu dau file.`);
+        log(`${key} ngan lai (bi lam lai?) - doc lai tu dau file.`);
         pos.offset = 0;
         pos.lineNo = 0;
         continue;
       }
       counters.bad += r.bad;
-      for (const { lineNo, record } of r.records) {
-        counters.lines += 1;
-        tracker.feed(record, { file: name, line: lineNo });
-      }
+      for (const { lineNo, record } of r.records) onRecord(lineNo, record);
       const moved = r.offset !== pos.offset;
       pos.offset = r.offset;
       pos.lineNo = r.lineNo;
@@ -219,6 +235,7 @@ async function watch(args) {
     if (queue.length < MAX_QUEUE) {
       try {
         readLogs();
+        readAppLogs();
       } catch (err) {
         log(`Loi khi doc log: ${describe(err)}`);
       }
@@ -254,6 +271,7 @@ async function watch(args) {
     console.log('--------------------------------------------');
     console.log(`Doc      : ${counters.lines} dong log, ${counters.statements} cau lenh`);
     console.log(`Bo qua   : ${counters.skippedLocal} cau lenh qua unix socket`);
+    console.log(`Tang web : ${counters.appEvents} su kien bao mat tu app/`);
     console.log(`${args.dryRun ? 'Phat hien' : 'Da ghi  '} : ${counters.written} canh bao`);
     if (counters.bad) console.log(`Dong hong: ${counters.bad} (bo qua)`);
     if (!ok) console.log(`CHUA GHI : ${queue.length} canh bao (database khong san sang) - lan chay sau se doc lai.`);

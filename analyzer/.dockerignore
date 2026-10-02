@@ -1,0 +1,11 @@
+# Không đưa vào image: phụ thuộc cài lại bằng npm ci, và .env chứa mật khẩu
+# (cấu hình trong container đến từ docker-compose.yml).
+node_modules
+.env
+.env.*
+!.env.example
+dist
+state
+*.log
+Dockerfile
+.dockerignore

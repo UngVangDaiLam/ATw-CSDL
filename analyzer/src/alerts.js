@@ -23,8 +23,20 @@ class AlertWriter {
 
   async connect() {
     if (this.dryRun) return;
+    this.broken = null;
     this.client = new Client(this.dbConfig);
+    // Ket noi song lau (che do watch) co the bi cat khi dang nhan roi - DB
+    // restart, reset.sh. pg phat su kien 'error' tren Client; khong co listener
+    // thi Node coi la loi chua bat va giet ca tien trinh. Danh dau hong de lan
+    // ghi sau ket noi lai.
+    this.client.on('error', (err) => {
+      this.broken = err;
+    });
     await this.client.connect();
+  }
+
+  get connected() {
+    return Boolean(this.client) && !this.broken;
   }
 
   async writeAll(alerts) {
@@ -40,9 +52,10 @@ class AlertWriter {
            VALUES ($1, $2, $3, $4)`,
           [a.db_user, a.rule_triggered, a.risk_score, JSON.stringify(a.detail)]
         );
-        this.written += 1;
       }
       await this.client.query('COMMIT');
+      // Chi dem sau COMMIT: ROLLBACK giua chung thi khong dong nao duoc ghi.
+      this.written += alerts.length;
     } catch (err) {
       await this.client.query('ROLLBACK').catch(() => {});
       throw err;
@@ -50,7 +63,9 @@ class AlertWriter {
   }
 
   async close() {
-    if (this.client) await this.client.end();
+    const c = this.client;
+    this.client = null;
+    if (c) await c.end().catch(() => {});
   }
 }
 

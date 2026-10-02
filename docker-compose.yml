@@ -1,6 +1,10 @@
 # =============================================================================
 #  Lab: Mô hình bảo mật CSDL nhiều lớp trên PostgreSQL
-#  Bước 1 - chỉ có postgres + pgadmin. app/analyzer/dashboard thêm ở bước sau.
+#  `docker compose up -d` dựng đủ: postgres, app, analyzer, dashboard, pgadmin.
+#
+#  Địa chỉ cố định trên dbnet (172.28.0.0/16) - cột `client` trong cảnh báo
+#  chỉ thẳng ra tiến trình nào gửi câu lệnh:
+#     .10 postgres   .20 app   .30 analyzer   .40 dashboard   .1 máy host
 # =============================================================================
 
 services:
@@ -120,6 +124,100 @@ services:
     networks:
       - dbnet
 
+  # ---------------------------------------------------------------------------
+  # Ba tiến trình ứng dụng. Mỗi cái kết nối bằng ĐÚNG role của nó, cấu hình
+  # truyền qua environment (không copy .env vào image - xem .dockerignore).
+  # Cổng chỉ publish trên 127.0.0.1: app có 2 lỗ hổng cố ý, dashboard không có
+  # đăng nhập - không được lộ ra mạng LAN.
+  #
+  # depends_on: service_healthy KHÔNG có nghĩa là init đã xong (CLAUDE.md "Bẫy
+  # 7"). Cả ba đều tự thử kết nối lại, nên khởi động sớm chỉ thấy vài lỗi
+  # kết nối đầu tiên rồi tự hết.
+  # ---------------------------------------------------------------------------
+  app:
+    build: ./app
+    image: secdb/app
+    container_name: secdb-app
+    restart: unless-stopped
+    init: true
+    environment:
+      DB_HOST: 172.28.0.10
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: app_user
+      DB_PASSWORD: ${APP_USER_PASSWORD}
+      # Khoa ky cookie phien: Docker secret (file), KHONG phai bien moi truong.
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+      PORT: 3000
+    secrets:
+      - session_secret
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      dbnet:
+        ipv4_address: 172.28.0.20
+
+  analyzer:
+    build: ./analyzer
+    image: secdb/analyzer
+    container_name: secdb-analyzer
+    restart: unless-stopped
+    # init: tiến trình init nhỏ làm PID 1, chuyển SIGTERM của `docker stop`
+    # tới node để watch.js ghi nốt cảnh báo đang chờ rồi mới thoát.
+    init: true
+    # PostgreSQL ghi log với log_file_mode = 0640, chủ là postgres (uid/gid
+    # 999). Analyzer chạy bằng user node (uid 1000) nên chỉ đọc được nhờ thêm
+    # NHÓM 999 - đủ để đọc, không cần chạy bằng root hay giả làm uid postgres.
+    group_add:
+      - "999"
+    environment:
+      DB_HOST: 172.28.0.10
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: analyzer_user
+      DB_PASSWORD: ${ANALYZER_PASSWORD}
+      LOG_DIR: /logs
+      STATE_FILE: /state/analyzer-state.json
+    volumes:
+      # Log là BẰNG CHỨNG: mount chỉ đọc, analyzer bị chiếm cũng không sửa/xóa
+      # được dấu vết. verify.sh có phép thử cho việc này.
+      - ./logs:/logs:ro
+      # Trạng thái dùng CHUNG với analyzer chạy trên host (cùng thư mục
+      # analyzer/state/): chuyển qua lại giữa hai nơi không ghi trùng cảnh báo.
+      - ./analyzer/state:/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      dbnet:
+        ipv4_address: 172.28.0.30
+
+  dashboard:
+    build: ./dashboard
+    image: secdb/dashboard
+    container_name: secdb-dashboard
+    restart: unless-stopped
+    init: true
+    environment:
+      DB_HOST: 172.28.0.10
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: dashboard_user
+      DB_PASSWORD: ${DASHBOARD_PASSWORD}
+      POLL_INTERVAL_MS: 2000
+      PORT: 4000
+    ports:
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      dbnet:
+        ipv4_address: 172.28.0.40
+
 secrets:
   # Sinh bằng: bash scripts/init-secrets.sh
   # Thư mục ./secrets/ nằm trong .gitignore - không bao giờ commit.
@@ -127,6 +225,8 @@ secrets:
     file: ./secrets/pgcrypto_key
   cccd_pepper:
     file: ./secrets/cccd_pepper
+  session_secret:
+    file: ./secrets/session_secret
 
 volumes:
   pgdata:

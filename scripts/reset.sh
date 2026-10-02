@@ -36,8 +36,10 @@ fi
 echo "==> Dung stack va xoa volume du lieu"
 docker compose down -v
 
-echo "==> Don WAL archive, backup va log cu (giu .gitkeep)"
-find backup/wal_archive backup/full logs -type f ! -name '.gitkeep' -delete 2>/dev/null || true
+echo "==> Don WAL archive, backup, log cu va trang thai analyzer (giu .gitkeep)"
+# analyzer/state: vi tri da doc trong cac file log vua bi xoa - giu lai thi vo
+# nghia, va file khoa cu cua watch cung nam o day.
+find backup/wal_archive backup/full logs analyzer/state -type f ! -name '.gitkeep' -delete 2>/dev/null || true
 # full_backup.sh tạo mỗi lần một thư mục con - xóa file xong còn vỏ rỗng.
 find backup/full -mindepth 1 -type d -empty -delete 2>/dev/null || true
 

@@ -204,7 +204,6 @@ BEGIN
     RAISE NOTICE '07_seed.sql: % khach hang, % don hang, % thanh toan', c, o, p;
 END $$;
 
--- Một cảnh báo mẫu để dashboard ở bước sau có dữ liệu render ngay.
-INSERT INTO audit.alerts (db_user, rule_triggered, risk_score, detail) VALUES
-    ('app_user', 'SEED_PLACEHOLDER', 10,
-     '{"note": "ban ghi mau tao luc khoi tao, analyzer se ghi de bang du lieu that"}'::jsonb);
+-- KHÔNG chèn cảnh báo mẫu vào audit.alerts. Mọi cảnh báo phải đi qua đường
+-- ống thật (log pgAudit -> analyzer -> analyzer_user INSERT) - một dòng viết
+-- tay ở đây sẽ hiện trên dashboard như bằng chứng thật.

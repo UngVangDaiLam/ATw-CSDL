@@ -42,3 +42,12 @@ coverage/
 Thumbs.db
 desktop.ini
 *.swp
+
+# Khoa + file tam cua analyzer --watch (cung la trang thai rieng tung may).
+.analyzer-state.json.*
+# Thu muc trang thai dung chung giua analyzer tren host va container.
+analyzer/state/*
+!analyzer/state/.gitkeep
+
+# Ban build giao dien cua app/ (npm run build)
+app/public/

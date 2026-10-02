@@ -1,11 +1,42 @@
 # dashboard/ — hiển thị cảnh báo lớp 3
 
-React + Socket.IO, hiển thị bảng `audit.alerts` theo thời gian thực.
+React (Vite) + Socket.IO, hiển thị bảng `audit.alerts` theo thời gian thực.
 
-Phần database đã chuẩn bị sẵn — **không cần động vào `postgres/`**. File này
-là mọi thứ cần biết để code giao diện.
+Phần database đã chuẩn bị sẵn — **không cần động vào `postgres/`**.
 
-## 1. Chuẩn bị (một lần)
+## 0. Chạy
+
+Mặc định chạy trong Docker cùng cả stack: `docker compose up -d` ở gốc repo, mở
+http://127.0.0.1:4000. Sửa code xong: `docker compose up -d --build dashboard`.
+
+Khi đang sửa giao diện (tự nạp lại), chạy tay trên host:
+
+```bash
+docker compose stop dashboard   # tránh hai tiến trình cùng cổng 4000
+cd dashboard
+npm install
+cp .env.example .env          # điền DB_PASSWORD (xem mục 1)
+npm run dev                   # mở http://127.0.0.1:5173
+```
+
+| Đường dẫn | Việc |
+|---|---|
+| `server/index.js` | Express + Socket.IO: poll `audit.alerts` mỗi `POLL_INTERVAL_MS`, gửi `snapshot` khi client kết nối, `alerts` khi có dòng mới, `status` khi kết nối DB đổi trạng thái. Đặt CSP chặn script inline. |
+| `server/alerts.js` | **Toàn bộ** câu SQL của dashboard (đọc cảnh báo, thống kê gộp một câu, đọc `pg_settings`). |
+| `src/hooks/useAlerts.js` | Nhận sự kiện socket, gộp trùng theo `id`. |
+| `src/pages/` | Tổng quan · Cảnh báo (lọc, tìm, xem chi tiết) · Theo dõi trực tiếp · Cấu hình pgAudit. |
+| `src/lib/alerts.js` | Tên hiển thị của rule, phân mức, định dạng giờ VN. Thêm rule mới ở analyzer thì thêm vào `RULES` ở đây. |
+
+Backend chỉ nghe trên `127.0.0.1` (đổi bằng `HOST` trong `.env`): dashboard
+không có đăng nhập mà lại hiển thị câu SQL tấn công và tên nhân viên bị nghi.
+
+Các script npm gọi thẳng `node node_modules/<pkg>/...` thay vì `vite` trần: đường
+dẫn repo có ký tự `&`, shim `.cmd` của npm trên Windows cắt chuỗi tại đó.
+
+Dashboard **không** chạy analyzer. Nó chỉ đọc được cảnh báo; muốn có cảnh báo
+mới thì chạy `bash scripts/gen-alerts.sh` (mục 2) — chúng hiện lên sau vài giây.
+
+## 1. Chuẩn bị database (một lần)
 
 ```bash
 # ở gốc repo, sau khi pull
@@ -75,7 +106,9 @@ Các rule và gợi ý màu:
 | `FULL_TABLE_READ` | 60 | đọc bảng nhạy cảm không có `WHERE` |
 | `AFTER_HOURS` | 40 | truy cập ngoài 7h–19h hoặc cuối tuần |
 
-Gợi ý phân mức: `>= 80` đỏ, `60–79` cam, `< 60` vàng.
+Phân mức: `>= 80` đỏ (Nghiêm trọng), `60–79` hổ phách (Cảnh giác), `< 60`
+xanh dương (Lưu ý). Mức thấp nhất không dùng vàng vì vàng và cam quá gần nhau,
+kể cả với người nhìn màu bình thường; màu luôn đi kèm điểm số và nhãn chữ.
 
 Các khóa thường có trong `detail`:
 

@@ -7,85 +7,76 @@
 //   node src/index.js --dry-run       chi in ra man hinh, khong ghi DB
 //   node src/index.js --all           doc lai tu dau (bo qua file trang thai)
 //   node src/index.js --quiet         chi in phan tong ket
+//   node src/index.js --watch         theo doi lien tuc, xem src/watch.js
+//   node src/index.js --dry-run --since="2026-10-02 22:35:00"
+//                                     chi xet log tu thoi diem do (nghiem thu)
 //
-// Chay mot lan roi thoat (batch). Muon theo doi lien tuc thi goi lai dinh ky -
-// file trang thai bao dam khong sinh canh bao trung.
+// Mac dinh chay mot lan roi thoat (batch). --watch giu tien trinh song, doc
+// log moi moi vai giay va ghi canh bao ngay khi phat hien. Ca hai dung chung
+// file trang thai nen chuyen qua lai giua hai che do khong sinh canh bao trung.
+//
+// MA THOAT: 0 thanh cong, 1 loi, 3 = co --watch dang chay nen lan batch nay
+// nhuong (khong ghi) - script goi analyzer nen cho watch tu ghi.
 
-const fs = require('fs');
 const path = require('path');
 
 const config = require('./config');
-const rules = require('./rules');
 const SessionTracker = require('./sessions');
 const AlertWriter = require('./alerts');
 const { readJsonLog, listJsonLogs } = require('./logReader');
-const { redactStatement } = require('./redact');
+const {
+  evaluate, isLocalSocket, printAlert, loadState, saveState,
+  activeWatcher, describeWatcher, parseSince, fileMayContainSince, recordAtOrAfter,
+} = require('./pipeline');
 
 const MAX_ALERTS_PER_RUN = 2000;
+const EXIT_WATCHER_ACTIVE = 3;
 
 function parseArgs(argv) {
+  const value = (name) => {
+    const a = argv.find((x) => x.startsWith(`--${name}=`));
+    return a ? a.slice(name.length + 3) : undefined;
+  };
   return {
     dryRun: argv.includes('--dry-run'),
     all: argv.includes('--all'),
     quiet: argv.includes('--quiet'),
+    watch: argv.includes('--watch'),
+    intervalMs: value('interval') ? Number(value('interval')) : undefined,
+    since: value('since'),
   };
-}
-
-function loadState(file, ignore) {
-  if (ignore || !fs.existsSync(file)) return { files: {} };
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return parsed && parsed.files ? parsed : { files: {} };
-  } catch (err) {
-    console.error(`Khong doc duoc file trang thai (${file}), coi nhu chay lai tu dau.`);
-    return { files: {} };
-  }
-}
-
-function saveState(file, state) {
-  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-}
-
-// Bien mot su kien cau lenh thanh cac canh bao (co the nhieu rule cung an).
-function evaluate(stmt) {
-  const out = [];
-  for (const rule of rules) {
-    let hit = null;
-    try {
-      hit = rule.run(stmt, config);
-    } catch (err) {
-      console.error(`Rule ${rule.name} loi: ${err.message}`);
-      continue;
-    }
-    if (!hit) continue;
-
-    out.push({
-      db_user: stmt.actor,
-      rule_triggered: hit.rule,
-      risk_score: hit.risk,
-      detail: {
-        ...hit.detail,
-        // Cau lenh da che du lieu nhay cam - xem redact.js. Bang audit.alerts
-        // KHONG duoc ma hoa, nen khong duoc phep chua CCCD hay so the o dang ro.
-        cau_lenh: redactStatement(stmt.statement),
-        session_id: stmt.sessionId,
-        pid: stmt.pid,
-        // session user luon la app_user; giu lai de doi chieu voi log tho va de
-        // thay ro no KHAC voi db_user o tren - do chinh la cho ma viec bam theo
-        // phien tao ra gia tri.
-        session_user: stmt.sessionUser,
-        client: stmt.remoteHost,
-        ung_dung: stmt.appName,
-        thoi_diem: stmt.timestamp,
-      },
-    });
-  }
-  return out;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const state = loadState(config.stateFile, args.all);
+  if (args.watch) return require('./watch').watch(args);
+
+  let since = null;
+  if (args.since !== undefined) {
+    since = parseSince(args.since);
+    if (!since) {
+      console.error(`--since phai co dang "YYYY-MM-DD HH:MM:SS[.mmm]" theo gio VN, nhan: "${args.since}"`);
+      process.exit(1);
+    }
+    // --since bo qua file trang thai; ghi that se trung canh bao da co.
+    if (!args.dryRun) {
+      console.error('--since chi dung kem --dry-run (danh cho nghiem thu, khong ghi DB).');
+      process.exit(1);
+    }
+  }
+
+  // Watch dang song thi no da/se xu ly dung doan log nay - ghi them la trung.
+  // --dry-run khong ghi gi nen van cho chay (scripts/verify.sh dung).
+  if (!args.dryRun) {
+    const watcher = activeWatcher();
+    if (watcher) {
+      console.log(`analyzer --watch dang chay (${describeWatcher(watcher)}) - canh bao se do no ghi.`);
+      console.log('Lan chay nay KHONG ghi, de tranh trung canh bao.');
+      process.exit(EXIT_WATCHER_ACTIVE);
+    }
+  }
+
+  const state = loadState(config.stateFile, args.all || Boolean(since));
 
   const files = listJsonLogs(config.logDir);
   if (files.length === 0) {
@@ -101,8 +92,7 @@ async function main() {
   const tracker = new SessionTracker((stmt) => {
     counters.statements += 1;
 
-    // Bo qua phien qua unix socket (superuser, script init). Xem config.js.
-    if (config.ignoreLocalSocket && (!stmt.remoteHost || stmt.remoteHost === '[local]')) {
+    if (isLocalSocket(stmt)) {
       counters.skippedLocal += 1;
       return;
     }
@@ -116,14 +106,16 @@ async function main() {
 
   for (const file of files) {
     if (capReached) break;   // giu nguyen trang thai cac file con lai
+    if (since && !fileMayContainSince(file, since)) continue;
 
     const name = path.basename(file);
     const already = state.files[name]?.lines || 0;
     let lastLine = already;
 
     for await (const { lineNo, record } of readJsonLog(file, already)) {
-      counters.lines += 1;
       lastLine = lineNo;
+      if (since && !recordAtOrAfter(record, since)) continue;
+      counters.lines += 1;
       tracker.feed(record);
       if (capReached) break;
     }
@@ -137,14 +129,7 @@ async function main() {
   const sorted = [...alerts].sort((a, b) => b.risk_score - a.risk_score);
 
   if (!args.quiet) {
-    for (const a of sorted) {
-      const d = a.detail;
-      console.log(
-        `[${String(a.risk_score).padStart(2)}] ${a.rule_triggered.padEnd(22)} ${String(a.db_user).padEnd(14)} ${d.thoi_diem}`
-      );
-      console.log(`     ${d.mo_ta}`);
-      console.log(`     ${d.cau_lenh}`);
-    }
+    for (const a of sorted) printAlert(a);
     if (sorted.length > 0) console.log('');
   }
 

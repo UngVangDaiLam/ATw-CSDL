@@ -52,9 +52,14 @@ class SessionTracker {
   constructor(onStatement) {
     this.sessions = new Map();
     this.onStatement = onStatement;
+    // Nhip doc hien tai - chi che do watch dung (xem flushIdle). Batch khong
+    // dong toi, van flushAll() o cuoi moi file nhu truoc.
+    this.tick = 0;
   }
 
-  feed(record) {
+  // pos (tuy chon, chi watch truyen): { file, line } cua dong nay, de biet cau
+  // lenh dang gom do bat dau tu dau - xem earliestPendingLine().
+  feed(record, pos) {
     const sessionId = record.session_id || `pid-${record.pid}`;
     let session = this.sessions.get(sessionId);
 
@@ -71,6 +76,7 @@ class SessionTracker {
       };
       this.sessions.set(sessionId, session);
     }
+    session.lastTick = this.tick;
 
     // Bo sung dan thong tin phien khi chung xuat hien.
     // KHONG lay mot lan o dong dau tien: dong dau cua moi phien la
@@ -109,6 +115,8 @@ class SessionTracker {
         encryptedRows: 0,
         head: null,
         timestamp: record.timestamp,
+        startFile: pos?.file,
+        startLine: pos?.line,
       };
     }
 
@@ -126,7 +134,15 @@ class SessionTracker {
 
       // Chi xet doi vai tren dong da duoc loc theo class - khong tim chuoi
       // "SET ROLE" trong moi cau lenh (xem auditLine.js).
-      if (audit.class === 'MISC' && audit.command === 'SET') {
+      //
+      // pgAudit ghi "RESET ROLE" la MISC,RESET chu KHONG phai MISC,SET. Bo sot
+      // no thi vai cu bam mai vao phien: app/ dung SET LOCAL ROLE (het hieu
+      // luc o COMMIT, ma COMMIT khong vao log), connection pool tai su dung
+      // ket noi, va cau dang nhap ke tiep tren ket noi do - doc app.staff khong
+      // SET ROLE - bi quy cho nhan vien cua request truoc thanh canh bao
+      // STAFF_CREDENTIAL_READ gia. app/src/middleware/setRole.js vi vay goi
+      // RESET ROLE sau moi COMMIT/ROLLBACK de de lai dau moc trong log.
+      if (audit.class === 'MISC' && (audit.command === 'SET' || audit.command === 'RESET')) {
         const change = extractRoleChange(audit.statement);
         if (change !== undefined) session.role = change;
       }
@@ -167,6 +183,38 @@ class SessionTracker {
   // dang gom do.
   flushAll() {
     for (const session of this.sessions.values()) this.flushSession(session);
+  }
+
+  // CHE DO WATCH. Mot cau lenh chi biet la "xong" khi phien do sang cau lenh
+  // ke tiep hoac dong lai - nhung phien cua connection pool co the ngoi im rat
+  // lau sau cau cuoi. Doi den luc do thi canh bao tre vo han.
+  //
+  // Cac dong cua cung mot cau lenh duoc PostgreSQL ghi ra gan nhu cung luc (ke
+  // ca hang nghin dong long nhau cua mot lan giai ma hang loat - phien do lien
+  // tuc co dong moi nen khong bi day ra giua chung). Vi vay phien nao KHONG co
+  // dong moi nao trong ca mot nhip doc thi cau dang gom coi nhu da xong.
+  //
+  // KHONG flushAll() moi nhip nhu batch: cat ngang mot cau lenh dang ghi do
+  // se tach no lam hai - dem trung bang, hoac chia doi so ban ghi bi giai ma
+  // va BULK_DECRYPT bo sot.
+  flushIdle() {
+    for (const session of this.sessions.values()) {
+      if (session.pending && session.lastTick < this.tick) this.flushSession(session);
+    }
+  }
+
+  // Dong nho nhat (trong file `file`) ma mot cau lenh chua gom xong bat dau.
+  // Watch chi duoc luu vi tri da doc toi TRUOC dong nay: luu qua no ma tien
+  // trinh bi dung thi cau lenh do mat han, vi lan sau doc tiep tu sau no.
+  earliestPendingLine(file) {
+    let min = null;
+    for (const session of this.sessions.values()) {
+      const p = session.pending;
+      if (p && p.startFile === file && p.startLine != null && (min === null || p.startLine < min)) {
+        min = p.startLine;
+      }
+    }
+    return min;
   }
 }
 

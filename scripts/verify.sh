@@ -181,12 +181,23 @@ expect "dashboard_user KHONG cham duoc du lieu nghiep vu" "permission denied for
 
 # -----------------------------------------------------------------------------
 section "LOP 3c - analyzer: phat hien hanh vi bat thuong"
-if ! command -v node >/dev/null 2>&1; then
-    printf '  \033[33mBO QUA\033[0m khong tim thay node - cai Node.js roi chay lai\n'
-elif [ ! -d analyzer/node_modules ]; then
-    printf '  \033[33mBO QUA\033[0m chua cai phu thuoc: cd analyzer && npm install\n'
-elif [ ! -f analyzer/.env ]; then
-    printf '  \033[33mBO QUA\033[0m thieu analyzer/.env - copy tu analyzer/.env.example\n'
+# Service analyzer trong Docker dang chay thi chay dry-run NGAY TRONG container
+# do: may host khong can cai Node. Khong thi dung analyzer tren host.
+ANALYZER_SKIP=""
+if docker compose ps --status running --services 2>/dev/null | grep -qx analyzer; then
+    ANALYZER_CMD=(docker compose exec -T analyzer node src/index.js)
+else
+    ANALYZER_CMD=(node analyzer/src/index.js)
+    if ! command -v node >/dev/null 2>&1; then
+        ANALYZER_SKIP="khong tim thay node, service analyzer cung khong chay (docker compose up -d analyzer)"
+    elif [ ! -d analyzer/node_modules ]; then
+        ANALYZER_SKIP="chua cai phu thuoc: cd analyzer && npm install"
+    elif [ ! -f analyzer/.env ]; then
+        ANALYZER_SKIP="thieu analyzer/.env - copy tu analyzer/.env.example"
+    fi
+fi
+if [ -n "$ANALYZER_SKIP" ]; then
+    printf '  \033[33mBO QUA\033[0m %s\n' "$ANALYZER_SKIP"
 else
     # Sinh hai hanh vi xau. CO Y chon hai cau KHONG phu thuoc thoi diem chay:
     # rule AFTER_HOURS dua vao gio he thong nen khong dung lam tieu chi duoc -
@@ -194,13 +205,35 @@ else
     #
     # Cau thu hai co so CCCD viet thang trong SQL: vua de thu rule, vua de kiem
     # chung analyzer CHE du lieu nhay cam truoc khi ghi vao audit.alerts.
+    #
+    # Moc thoi gian lay TU DATABASE theo log_timezone (khong lay gio may host):
+    # analyzer chi xet log tu moc nay (--since). Khong doc tiep tu file trang
+    # thai nhu binh thuong vi mot analyzer --watch dang chay co the da xu ly va
+    # luu vi tri vuot qua cac dong ben duoi truoc khi dry-run kip doc.
+    SINCE="$(sql_su "SELECT to_char(now() AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD HH24:MI:SS.MS');")"
     sql_nv nv_hcm01 'SELECT count(app.decrypt_text(cccd)) FROM app.customers;' >/dev/null
     sql_nv nv_hcm01 "SELECT full_name FROM app.customers WHERE cccd_hash = app.blind_index('079203000005') UNION SELECT password_hash FROM app.staff;" >/dev/null
+
+    # Mo phong dung trinh tu cua app/ tren MOT ket noi duoc pool tai su dung:
+    # request cua nv_dn01 (SET LOCAL ROLE trong transaction), roi tren CUNG ket
+    # noi do la cau dang nhap doc app.staff KHONG SET ROLE. psql doc tu stdin
+    # gui tung cau rieng le - giong app, khac -c (ca chuoi chung mot dong log).
+    #   doi_chung: KHONG co RESET ROLE -> analyzer van tuong vai nv_dn01 con hieu
+    #              luc (COMMIT khong vao log) -> quy nham, canh bao gia.
+    #   that:      co RESET ROLE nhu setRole.js -> analyzer tra vai -> khong gan nham.
+    login_after_request() {
+        printf "BEGIN;\nSET LOCAL ROLE nv_dn01;\nSELECT id FROM app.customers WHERE id = 1;\nCOMMIT;\n%s\nSELECT username FROM app.staff WHERE username = '%s';\n" "$1" "$2" \
+            | docker compose exec -T postgres psql "$APP_URL" -q >/dev/null 2>&1
+    }
+    login_after_request "" "verify_khong_reset"
+    login_after_request "RESET ROLE;" "verify_co_reset"
     sleep 2
 
-    # --dry-run: khong ghi vao audit.alerts, nen nghiem thu khong lam ban bang
-    # canh bao that.
-    ANALYZER_OUT="$(node analyzer/src/index.js --dry-run 2>&1)"
+    # --dry-run: lan chay NAY khong tu ghi vao audit.alerts. Nhung neu service
+    # analyzer (--watch) dang chay thi no CO ghi cac hanh vi tren thanh canh bao
+    # that - dung vay, do la cau lenh that da chay. Cot `client` cua chung la
+    # 172.28.0.10 (psql trong container postgres), phan biet voi app (.20).
+    ANALYZER_OUT="$("${ANALYZER_CMD[@]}" --dry-run --since="$SINCE" 2>&1)"
 
     expect "analyzer phat hien giai ma hang loat" "BULK_DECRYPT" "$ANALYZER_OUT"
     expect "analyzer phat hien dau vet UNION SELECT" "SQLI_UNION" "$ANALYZER_OUT"
@@ -216,7 +249,163 @@ else
     else
         ok "CCCD KHONG lot ra canh bao o dang ro"
     fi
+
+    # Moi canh bao in 3 dong: [diem] RULE nguoi | mo ta | cau lenh. Tim dong cau
+    # lenh chua dau moc roi nhin 2 dong phia tren.
+    staff_alert_for() { printf '%s' "$ANALYZER_OUT" | grep -B2 -F "$1" | grep 'STAFF_CREDENTIAL_READ'; }
+    # Doi chung: chung minh phep thu duoi khong vo nghia - thieu dau moc thi
+    # analyzer CO gan nham that.
+    if staff_alert_for 'verify_khong_reset' | grep -q 'nv_dn01'; then
+        ok "doi chung: thieu RESET ROLE thi dang nhap bi gan nham cho nv_dn01"
+    else
+        bad "doi chung: thieu RESET ROLE thi dang nhap bi gan nham cho nv_dn01" \
+            "STAFF_CREDENTIAL_READ nv_dn01" "khong thay - phep thu RESET ROLE ben duoi mat y nghia"
+    fi
+    # app/src/middleware/setRole.js goi RESET ROLE sau moi COMMIT/ROLLBACK.
+    if staff_alert_for 'verify_co_reset' | grep -q .; then
+        bad "co RESET ROLE: dang nhap tren ket noi tai su dung KHONG bi gan nham" \
+            "khong co STAFF_CREDENTIAL_READ" "$(staff_alert_for 'verify_co_reset' | head -1)"
+    else
+        ok "co RESET ROLE: dang nhap tren ket noi tai su dung KHONG bi gan nham"
+    fi
 fi
+
+# -----------------------------------------------------------------------------
+section "TRIEN KHAI - app, analyzer, dashboard trong Docker"
+SERVICES_UP="$(docker compose ps --status running --services 2>/dev/null)"
+MISSING=""
+for s in app analyzer dashboard; do printf '%s\n' "$SERVICES_UP" | grep -qx "$s" || MISSING="$MISSING $s"; done
+if [ -z "$MISSING" ]; then ok "ca ba service app, analyzer, dashboard dang chay"
+else bad "ca ba service app, analyzer, dashboard dang chay" "dang chay" "khong chay:$MISSING (docker compose up -d)"; fi
+
+# Tien trinh trong container KHONG chay bang root (Dockerfile: USER node).
+ROOTED=""
+for s in app analyzer dashboard; do
+    uid="$(docker compose exec -T "$s" id -u 2>/dev/null | tr -d '[:space:]')"
+    [ "$uid" = "0" ] || [ -z "$uid" ] && ROOTED="$ROOTED $s(uid=${uid:-?})"
+done
+if [ -z "$ROOTED" ]; then ok "ca ba container chay bang user thuong, khong phai root"
+else bad "ca ba container chay bang user thuong, khong phai root" "uid khac 0" "$ROOTED"; fi
+
+# Log pgAudit la bang chung: analyzer bi chiem cung khong duoc sua/xoa duoc.
+expect "analyzer KHONG ghi duoc vao thu muc log (mount chi doc)" "Read-only file system" \
+       "$(docker compose exec -T analyzer sh -c 'touch /logs/.verify_probe' 2>&1)"
+
+# .env chua mat khau - khong duoc nam trong image (.dockerignore).
+LEAKED=""
+for s in app analyzer dashboard; do
+    docker compose exec -T "$s" sh -c 'test -e /app/.env' 2>/dev/null && LEAKED="$LEAKED $s"
+done
+if [ -z "$LEAKED" ]; then ok "khong image nao chua file .env"
+else bad "khong image nao chua file .env" "khong co /app/.env" "co trong:$LEAKED"; fi
+
+# App co 2 lo hong co y, dashboard khong co dang nhap: chi mo tren loopback.
+PUBLISHED="$(docker compose port app 3000 2>&1) $(docker compose port dashboard 4000 2>&1)"
+if printf '%s' "$PUBLISHED" | grep -qE '^127\.0\.0\.1:[0-9]+ 127\.0\.0\.1:[0-9]+$'; then
+    ok "cong app va dashboard chi mo tren 127.0.0.1"
+else bad "cong app va dashboard chi mo tren 127.0.0.1" "127.0.0.1:<cong> cho ca hai" "$PUBLISHED"; fi
+
+# App trong container ket noi bang dung app_user (khong phai superuser/db_owner).
+expect "app trong container ket noi database bang app_user" '"current_user":"app_user"' \
+       "$(curl -s "http://127.0.0.1:${APP_HOST_PORT:-3000}/health" 2>&1)"
+
+# -----------------------------------------------------------------------------
+section "WEB - lop bao ve tang HTTP cua app/"
+# Khoa ky cookie phien: thieu, dung gia tri mau hoac qua ngan thi app tu choi
+# khoi dong (ban goc am tham dung khoa mac dinh viet thang trong code).
+# Container tam chay thang tu image, KHONG mang (--network none): app phai dung
+# truoc khi kip noi DB. Khong dung `docker compose run app` vi no thua ke IP co
+# dinh 172.28.0.20 cua service va dung voi container app dang chay.
+expect "app TU CHOI khoi dong khi SESSION_SECRET la gia tri mau" "KHONG KHOI DONG" \
+       "$(docker run --rm --network none -e SESSION_SECRET=doi_chuoi_bi_mat_nay secdb/app 2>&1)"
+# Trong Docker khoa la Docker secret (file), khong phai bien moi truong:
+# `docker inspect` / /proc/<pid>/environ khong doc duoc.
+expect "khoa phien KHONG nam trong bien moi truong cua container app" "0" \
+       "$(docker compose exec -T app sh -c 'env | grep -c "^SESSION_SECRET="' 2>&1)"
+
+# Header bao mat (app/src/httpHeaders.js). Goi 127.0.0.1, KHONG goi localhost -
+# xem CLAUDE.md "Bay 8".
+WEB="http://127.0.0.1:${APP_HOST_PORT:-3000}"
+HDR="$(curl -s -D - -o /dev/null "$WEB/health" 2>&1 | tr -d '\r')"
+if printf '%s' "$HDR" | grep -qi "^content-security-policy:.*script-src 'self'.*frame-ancestors 'none'"; then
+    ok "CSP chan script la va chan nhung trang vao iframe"
+else bad "CSP chan script la va chan nhung trang vao iframe" "script-src 'self' ... frame-ancestors 'none'" "$(printf '%s' "$HDR" | grep -i '^content-security' | cut -c1-120)"; fi
+if printf '%s' "$HDR" | grep -qi '^x-content-type-options: nosniff' && ! printf '%s' "$HDR" | grep -qi '^x-powered-by'; then
+    ok "co nosniff va KHONG lo X-Powered-By"
+else bad "co nosniff va KHONG lo X-Powered-By" "nosniff, khong X-Powered-By" "$(printf '%s' "$HDR" | grep -iE '^(x-content-type|x-powered)' | tr '\n' ' ')"; fi
+
+# CSRF (app/src/csrf.js): request ghi du lieu phai la JSON va mang token.
+JAR="$(mktemp)"
+CSRF_TOKEN="$(curl -s -c "$JAR" -b "$JAR" "$WEB/auth/csrf" | grep -o '"csrfToken":"[0-9a-f]*"' | cut -d'"' -f4)"
+SID_BEFORE="$(grep -o 'secdb.sid[[:space:]]*[^[:space:]]*$' "$JAR" | awk '{print $2}')"
+expect "dang nhap KHONG co CSRF token bi tu choi (403)" "403" \
+       "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$WEB/auth/login" -H 'Content-Type: application/json' \
+          -d '{"username":"hn01","password":"Demo@123456"}')"
+# Form HTML tu trang khac chi gui duoc urlencoded/multipart/text/plain.
+expect "request ghi KHONG phai JSON bi tu choi (415)" "415" \
+       "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$WEB/auth/login" -H "X-CSRF-Token: $CSRF_TOKEN" \
+          -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=hn01&password=Demo@123456')"
+
+# Dang nhap dung cach (co token) bang tai khoan demo cua 07_seed.sql.
+# Cookie phien: HttpOnly (XSS khong doc duoc), SameSite=Strict (khong di theo
+# request tu trang khac).
+LOGIN_HDR="$(curl -s -D - -o /dev/null -c "$JAR" -b "$JAR" -X POST "$WEB/auth/login" -H 'Content-Type: application/json' \
+             -H "X-CSRF-Token: $CSRF_TOKEN" -d '{"username":"hn01","password":"Demo@123456"}' 2>&1 | tr -d '\r')"
+COOKIE_LINE="$(printf '%s' "$LOGIN_HDR" | grep -i '^set-cookie: secdb.sid=')"
+if printf '%s' "$COOKIE_LINE" | grep -qi 'HttpOnly' && printf '%s' "$COOKIE_LINE" | grep -qi 'SameSite=Strict'; then
+    ok "cookie phien co HttpOnly va SameSite=Strict"
+else bad "cookie phien co HttpOnly va SameSite=Strict" "secdb.sid=...; HttpOnly; SameSite=Strict" "${COOKIE_LINE:-khong co Set-Cookie secdb.sid}"; fi
+
+# Session fixation: phien co TRUOC khi dang nhap (tao boi GET /auth/csrf) phai
+# bi thay bang ma phien moi, khong duoc "nang cap" thanh phien da dang nhap.
+SID_AFTER="$(grep -o 'secdb.sid[[:space:]]*[^[:space:]]*$' "$JAR" | awk '{print $2}')"
+if [ -n "$SID_BEFORE" ] && [ -n "$SID_AFTER" ] && [ "$SID_BEFORE" != "$SID_AFTER" ]; then
+    ok "dang nhap cap ma phien MOI (chong session fixation)"
+else bad "dang nhap cap ma phien MOI (chong session fixation)" "ma phien truoc != sau" "truoc=${SID_BEFORE:0:16} sau=${SID_AFTER:0:16}"; fi
+
+# Da dang nhap nhung thieu token thi van khong ghi duoc. Chi thu nhanh bi chan:
+# ban co token se INSERT that, ma verify.sh khong de lai du lieu.
+expect "da dang nhap nhung thieu CSRF token: KHONG tao duoc khach hang (403)" "403" \
+       "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$WEB/customers" -H 'Content-Type: application/json' \
+          -d '{"full_name":"verify_csrf"}')"
+rm -f "$JAR"
+
+# Gioi han dang nhap sai (app/src/loginLimiter.js): 5 lan sai cho mot cap
+# (IP, username) -> lan thu 6 bi tu choi 429. Dung username NGAU NHIEN khong ton
+# tai: khoa theo cap, khoa nham hn01 thi demo-attack.sh va chinh verify.sh
+# khong dang nhap duoc trong 15 phut.
+JAR="$(mktemp)"
+BF_USER="verify_bf_$RANDOM$RANDOM"
+BF_TOKEN="$(curl -s -c "$JAR" -b "$JAR" "$WEB/auth/csrf" | grep -o '"csrfToken":"[0-9a-f]*"' | cut -d'"' -f4)"
+bf_try() {
+    curl -s -D - -o /dev/null -c "$JAR" -b "$JAR" -X POST "$WEB/auth/login" -H 'Content-Type: application/json' \
+         -H "X-CSRF-Token: $BF_TOKEN" -d "{\"username\":\"$1\",\"password\":\"$2\"}" | tr -d '\r'
+}
+BF_CODES=""
+for _ in 1 2 3 4 5; do BF_CODES="$BF_CODES $(bf_try "$BF_USER" sai_mat_khau | head -1 | awk '{print $2}')"; done
+BF_SIXTH="$(bf_try "$BF_USER" sai_mat_khau)"
+if [ "$BF_CODES" = " 401 401 401 401 401" ] && printf '%s' "$BF_SIXTH" | head -1 | grep -q ' 429' \
+   && printf '%s' "$BF_SIXTH" | grep -qi '^retry-after: [0-9]'; then
+    ok "5 lan dang nhap sai -> lan thu 6 bi khoa (429 + Retry-After)"
+else bad "5 lan dang nhap sai -> lan thu 6 bi khoa (429 + Retry-After)" "401 x5 roi 429" \
+         "$BF_CODES ->$(printf '%s' "$BF_SIXTH" | head -1)"; fi
+# Khoa theo CAP (IP, username): tai khoan khac tu cung IP van dang nhap duoc.
+expect "khoa chi ap cho username bi do - tai khoan khac van dang nhap duoc" " 200" \
+       "$(bf_try hn01 Demo@123456 | head -1)"
+rm -f "$JAR"
+
+# Giao dien web (app/web -> public/) phuc vu cung origin voi API, va cung mang
+# CSP nhu moi phan hoi khac.
+UI_PAGE="$(curl -s -D - "$WEB/" 2>&1 | tr -d '\r')"
+if printf '%s' "$UI_PAGE" | grep -q '<title>SecDB · Quản lý khách hàng</title>' \
+   && printf '%s' "$UI_PAGE" | grep -qi "^content-security-policy:.*script-src 'self'"; then
+    ok "app phuc vu giao dien web cung origin, co CSP"
+else bad "app phuc vu giao dien web cung origin, co CSP" "<title>SecDB · Quản lý khách hàng</title> + CSP" \
+         "$(printf '%s' "$UI_PAGE" | grep -iE '<title>|^content-security|^HTTP' | tr '\n' ' ' | cut -c1-120)"; fi
+
+# Phan hoi co du lieu khach hang khong duoc luu lai o trinh duyet/proxy.
+expect "API du lieu tra ve Cache-Control: no-store" "no-store" \
+       "$(curl -s -D - -o /dev/null "$WEB/customers" 2>&1 | tr -d '\r' | grep -i '^cache-control')"
 
 # -----------------------------------------------------------------------------
 section "DU LIEU - khoi luong theo yeu cau de bai"

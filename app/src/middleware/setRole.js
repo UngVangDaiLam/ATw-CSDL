@@ -51,6 +51,16 @@ async function setRoleTransaction(req, res, next) {
     client
       .query(finalize)
       .catch((err) => console.error(`Loi ${finalize} transaction:`, err.message))
+      // SET LOCAL ROLE da tu het hieu luc o COMMIT/ROLLBACK, nen RESET ROLE
+      // KHONG doi gi trong database. No o day cho LOP 3: pgAudit khong ghi
+      // COMMIT, nen analyzer khong biet vai da het. Ket noi tra ve pool roi
+      // duoc request sau dung lai - vd. luong dang nhap (pool.query doc
+      // app.staff, khong SET ROLE) - thi analyzer quy cau do cho nhan vien cua
+      // request TRUOC, sinh canh bao STAFF_CREDENTIAL_READ gia gan nham nguoi.
+      // RESET ROLE vao log (class misc_set) la dau moc de analyzer tra vai.
+      // Dung bo dong nay.
+      .then(() => client.query('RESET ROLE'))
+      .catch((err) => console.error('Loi RESET ROLE:', err.message))
       .finally(() => client.release());
   });
 

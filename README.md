@@ -36,7 +36,8 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 62 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 83 phép thử nghiệm thu
+│   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
 │   ├── bench/              # kịch bản pgbench, mỗi cặp chỉ khác đúng một cơ chế
@@ -50,7 +51,9 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │   ├── threat-model.md     # STRIDE cho app/, ranh giới tin cậy app <-> DB
 │   ├── performance.md      # phân tích chi phí hiệu năng từng lớp (viết tay)
 │   └── benchmark-results.md # số đo thô, sinh bởi scripts/benchmark.sh
-├── app/                    # backend Express - xem app/README.md
+├── app/                    # backend Express + giao diện web - xem app/README.md
+│   ├── Dockerfile          # build giao diện (web/ -> public/) rồi chạy backend
+│   ├── web/                # giao diện React + Vite
 │   ├── package.json
 │   ├── .env.example
 │   └── src/
@@ -58,16 +61,21 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── middleware/     # requireAuth.js, setRole.js (SET LOCAL ROLE nv_xxx)
 │       └── routes/         # auth.js, customers.js, orders.js
 ├── analyzer/               # lớp 3: đọc log pgAudit -> audit.alerts
+│   ├── Dockerfile          # chạy --watch, log mount chỉ đọc
+│   ├── state/              # vị trí đã đọc - dùng chung host <-> container
 │   ├── package.json
 │   ├── .env.example
 │   └── src/
-│       ├── index.js        # CLI, chạy một lần rồi thoát
+│       ├── index.js        # CLI: chạy một lần (batch), hoặc --watch
+│       ├── watch.js        # theo dõi liên tục
+│       ├── tail.js         # đọc tăng dần theo vị trí byte
+│       ├── pipeline.js     # phần chung hai chế độ: rule, khóa watch
 │       ├── auditLine.js    # tách trường CSV bên trong `message` của pgAudit
 │       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
 │       └── rules/          # 6 rule phát hiện
-└── dashboard/              # chưa có code; phía DB đã sẵn - xem dashboard/README.md
+└── dashboard/              # React + Socket.IO, đọc audit.alerts bằng dashboard_user - xem dashboard/README.md
 ```
 
 ## 2. Chạy
@@ -80,6 +88,30 @@ bash scripts/init-secrets.sh   # sinh khóa mã hóa - BẮT BUỘC trước l�
 docker compose up -d --build
 docker compose ps
 ```
+
+Một lệnh dựng đủ 5 service:
+
+| Service | Địa chỉ | Việc |
+|---------|---------|------|
+| `postgres` | `localhost:15432` (dbnet `.10`) | PostgreSQL 16 + pgAudit |
+| `app` | http://127.0.0.1:3000 (dbnet `.20`) | giao diện web + backend Express, kết nối bằng `app_user` |
+| `analyzer` | — (dbnet `.30`) | `--watch`: đọc log liên tục, ghi `audit.alerts` bằng `analyzer_user` |
+| `dashboard` | http://127.0.0.1:4000 (dbnet `.40`) | giao diện cảnh báo, đọc bằng `dashboard_user` |
+| `pgadmin` | http://localhost:8081 | quản trị |
+
+`app` và `dashboard` chỉ mở trên `127.0.0.1`: app có 2 lỗ hổng cố ý, dashboard
+không có đăng nhập. Analyzer đọc log qua thư mục mount **chỉ đọc** — bị chiếm
+cũng không xóa được dấu vết. Cả ba container chạy bằng user thường, không phải
+root, và không image nào chứa `.env` (cấu hình truyền qua `environment` của
+compose). `verify.sh` có phép thử cho từng điều này.
+
+```bash
+docker compose logs -f analyzer     # xem cảnh báo được phát hiện theo thời gian thực
+```
+
+Vẫn chạy tay từng thư mục được (`npm install` rồi xem README riêng) — khi đó
+**tắt service tương ứng trước**, nếu không sẽ có hai tiến trình cùng cổng (xem
+CLAUDE.md "Bẫy 8").
 
 Thiếu bước `init-secrets.sh` thì container khởi động được nhưng script seed sẽ
 báo lỗi rõ ràng (`Khong doc duoc /run/secrets/pgcrypto_key`) — cố ý fail to
@@ -297,12 +329,9 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
   hàm có tên rõ ràng → xuất hiện trong log pgAudit → lớp 3 phát hiện được hành
   vi giải mã hàng loạt.
 
-### Xoay khóa
-
-Chưa triển khai. `pgp_sym_encrypt` gắn chặt với khóa đang dùng, nên
-`scripts/init-secrets.sh --force` sẽ làm **toàn bộ dữ liệu cũ không giải mã
-được nữa**. Đổi khóa thật phải đi kèm mã hóa lại toàn bộ dữ liệu trong một
-transaction, và cần thêm cột `key_version` để hỗ trợ giai đoạn hai khóa.
+> **Đừng chạy `scripts/init-secrets.sh --force` trên database đang có dữ liệu.**
+> `pgp_sym_encrypt` gắn chặt với khóa: sinh khóa mới thì `cccd`, `card_token`
+> cũ không giải mã được nữa. Đổi khóa phải đi kèm `scripts/reset.sh`.
 
 ## 5. Nghiệm thu
 
@@ -310,7 +339,7 @@ transaction, và cần thêm cột `key_version` để hỗ trợ giai đoạn h
 bash scripts/verify.sh
 ```
 
-Chạy 62 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 83 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
@@ -409,7 +438,11 @@ thực nghiệm luận điểm defense-in-depth — chi tiết và cách khai th
 [`app/README.md`](app/README.md), threat model STRIDE ở
 [`docs/threat-model.md`](docs/threat-model.md).
 
+Chạy sẵn trong Docker (service `app`, http://127.0.0.1:3000). Chạy tay khi
+đang sửa code — tắt container trước để khỏi trùng cổng:
+
 ```bash
+docker compose stop app
 cd app && npm install && cp .env.example .env && npm run dev
 ```
 
@@ -419,11 +452,20 @@ cd app && npm install && cp .env.example .env && npm run dev
 `SET ROLE`, áp 6 rule phát hiện, ghi cảnh báo vào `audit.alerts` bằng
 `analyzer_user` (chỉ `INSERT`).
 
+Chạy sẵn trong Docker ở chế độ `--watch` (service `analyzer`): mọi hành vi
+trên app thành cảnh báo sau 1–4 giây, không ai phải gõ lệnh.
+
 ```bash
+docker compose logs -f analyzer      # xem phát hiện theo thời gian thực
+
+# Chạy tay trên host (dùng chung trạng thái với container qua analyzer/state/):
 cd analyzer && npm install && cp .env.example .env
 node src/index.js --dry-run --all    # xem thử, không ghi database
 node src/index.js                    # đọc phần log mới, ghi cảnh báo
 ```
+
+Batch trên host tự nhường (mã thoát 3, không ghi) khi watch đang chạy — ở host
+hay trong container — để không ghi trùng.
 
 Điểm cốt lõi: cột `user` trong log **luôn** là `app_user`, nên nhìn log thô thì
 không quy được trách nhiệm cho ai. Analyzer bám theo từng phiên để biết câu lệnh
@@ -486,6 +528,44 @@ Chính việc đo đã tìm ra một lỗi hiệu năng trong policy RLS (hàm b
 từng dòng, chậm ×12) mà không phép thử chức năng nào bắt được — xem mục 1 của
 `docs/performance.md`.
 
+## 7e. `dashboard/` — lớp 3, chiều đọc
+
+Giao diện React hiển thị `audit.alerts` theo thời gian thực. Backend Node kết
+nối bằng `dashboard_user` (chỉ `SELECT` trên đúng bảng đó), poll theo `id` mỗi
+2 giây rồi đẩy xuống trình duyệt qua Socket.IO — không dùng `LISTEN/NOTIFY`, lý
+do ở [`dashboard/README.md`](dashboard/README.md) mục 5.
+
+Chạy sẵn trong Docker: mở http://127.0.0.1:4000, rồi chạy
+`bash scripts/demo-attack.sh` hoặc `bash scripts/gen-alerts.sh` để thấy cảnh
+báo hiện lên. Sửa giao diện thì xem `dashboard/README.md` mục 0 (`npm run dev`).
+
+Dashboard không có nút "chạy phân tích": nó chỉ đọc được cảnh báo, còn ghi là
+việc của analyzer (`analyzer_user`, chỉ `INSERT`). Không tiến trình nào vừa đọc
+vừa ghi được `audit.alerts`.
+
+## 7f. Demo tấn công đầu-cuối
+
+```bash
+bash scripts/demo-attack.sh          # dừng chờ Enter giữa các bước
+bash scripts/demo-attack.sh --yes    # chạy một mạch
+```
+
+Diễn lại hai lỗ hổng **cố ý** của `app/` qua đúng HTTP endpoint, rồi cho thấy
+tầng database vẫn giữ — bài thực nghiệm trung tâm cho luận điểm defense-in-depth:
+
+| Bước | Tấn công (tầng app) | Lớp chặn (tầng DB) | Kết quả |
+|------|---------------------|---------------------|---------|
+| 3 | SQLi UNION đọc `app.staff` | — (`staff` không bật RLS) | **Lộ** `password_hash` (bcrypt). RLS không thay được parameterized query. |
+| 3b | SQLi UNION đọc `app.customers` chi nhánh khác | RLS (FORCE) + mã hóa cột | Chỉ kéo được chi nhánh mình; `cccd` là ciphertext `\x…` |
+| 4 | IDOR `/orders/:id` chi nhánh khác | RLS `branch_isolation` | `404` dù code không kiểm tra quyền |
+| 5–6 | (log các hành vi trên) | pgAudit + analyzer | `SQLI_UNION`, `STAFF_CREDENTIAL_READ`… quy về đúng `nv_hn01` |
+
+Script tự khởi động `app/` nếu chưa chạy (và tự tắt khi xong), chạy analyzer,
+rồi đọc cảnh báo bằng `dashboard_user`. Mở `dashboard/` song song để xem cảnh
+báo hiện realtime. Giới hạn trung thực: analyzer **không** bắt được IDOR (truy
+vấn hợp lệ về cú pháp) — chính RLS mới chặn nó.
+
 ## 8. Bước tiếp theo
 
-- **`dashboard/`** — React + Socket.IO hiển thị `audit.alerts` realtime.
+- Tài liệu báo cáo: kiến trúc, lý do thiết kế từng lớp, ánh xạ mối đe dọa →
+  lớp chặn → phép thử `verify.sh`, sơ đồ 4 lớp, slide.

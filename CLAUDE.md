@@ -17,24 +17,24 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 | 3 | `pgAudit` + analyzer tự viết | **Xong** (6 rule, ghi `audit.alerts` bằng `analyzer_user`) |
 | 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (62 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (83 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
 `05_crypto` → `06_rls` → `07_seed`.
 
-Stack dự kiến: PostgreSQL 16 · Node.js + Express (`app/`) · Node.js
-(`analyzer/`) · React + Socket.IO (`dashboard/`). `app/` và `analyzer/` đã có
-code (xem `app/README.md`, `analyzer/README.md` và hai mục quy ước bên dưới);
-`dashboard/` chưa có code, nhưng phía DB đã sẵn (`dashboard_user`, xem
-`dashboard/README.md`).
+Stack: PostgreSQL 16 · Node.js + Express (`app/`) · Node.js (`analyzer/`) ·
+React + Vite + Socket.IO (`dashboard/`). Cả ba đều đã có code — xem README
+riêng của từng thư mục và các mục quy ước bên dưới.
 
 ## Lệnh thường dùng
 
 ```bash
-docker compose up -d --build
+docker compose up -d --build         # postgres + app + analyzer + dashboard + pgadmin
 docker compose ps
 docker compose logs postgres          # gần như trống, xem mục "Log" bên dưới
+docker compose logs -f analyzer       # cảnh báo được phát hiện theo thời gian thực
+# app: http://127.0.0.1:3000   dashboard: http://127.0.0.1:4000
 
 # Superuser — CHỈ qua socket trong container
 docker compose exec postgres psql -U postgres -d secdb
@@ -138,6 +138,22 @@ phân biệt chắc chắn, và cũng là thứ `scripts/reset.sh` đang dùng �
 ```bash
 docker compose exec -T postgres pg_isready -h 172.28.0.10 -p 5432 -q
 ```
+
+**8. Chạy tay `app/` hay `dashboard/` trên host khi container đang chạy →
+hai tiến trình cùng cổng, không báo lỗi.** Container chỉ publish trên
+`127.0.0.1:3000`; `node src/server.js` trên host nghe `::` (cả IPv6). Windows
+cho cả hai cùng bind, và `localhost` phân giải ra `::1` trước nên request đi
+vào bản trên host. Mọi thứ vẫn "chạy được" — chỉ lộ ra ở cột `client` của cảnh
+báo: `172.28.0.1` (host) thay vì `172.28.0.20` (container app). Chạy tay thì
+`docker compose stop app` trước; script và phép thử luôn gọi `127.0.0.1`, không
+gọi `localhost`. Cùng họ với "Bẫy 5".
+
+**9. Analyzer trong container đọc log nhờ NHÓM 999, không phải nhờ root.**
+PostgreSQL ghi log với `log_file_mode = 0640` (chủ postgres, uid/gid 999);
+analyzer chạy bằng user `node` (uid 1000) nên cần `group_add: ["999"]` trong
+compose. Thiếu nó: `EACCES` khi đọc log — trên Windows host thì file vẫn đọc
+được nên chạy analyzer tay không bao giờ thấy lỗi này. Đừng "sửa" bằng cách cho
+container chạy root, cũng đừng nới `log_file_mode`.
 
 ## Quy ước phải giữ
 
@@ -275,6 +291,12 @@ này. Đọc `app/README.md` trước khi sửa — dưới đây chỉ là ph�
   đăng nhập ở `routes/auth.js`), rồi `COMMIT`/`ROLLBACK` theo status code khi
   response kết thúc. **Đừng** quay lại kiểu `set_config('app.branch_id', ...)`
   của bản gốc — RLS ở `06_rls.sql` không đọc GUC đó, nó đọc `current_user`.
+- **Đừng bỏ `RESET ROLE` sau `COMMIT`/`ROLLBACK` trong `setRole.js`.** Với
+  database nó vô tác dụng (`SET LOCAL` đã hết), nhưng nó là mốc duy nhất trong
+  log cho analyzer biết vai đã hết — pgAudit không ghi `COMMIT`. Thiếu nó, kết
+  nối pool được tái sử dụng cho lượt đăng nhập kế tiếp (đọc `app.staff`) bị quy
+  cho nhân viên của request trước → `STAFF_CREDENTIAL_READ` giả, gán nhầm
+  người. `verify.sh` có phép thử đối chứng cho việc này.
 - **`SET LOCAL ROLE ...` không tham số hóa được.** Giao thức parameterized
   query của PostgreSQL không hỗ trợ `$1` cho câu `SET`, nên phải nối chuỗi tên
   role. An toàn vì `db_user` không phải input trực tiếp từ client — nó đến từ
@@ -291,6 +313,23 @@ này. Đọc `app/README.md` trước khi sửa — dưới đây chỉ là ph�
   branch_id) tồn tại có chủ đích để chứng minh RLS vẫn chặn được rò rỉ dù code
   app sai — xem "Lỗ hổng cố ý" trong `app/README.md`. Nếu vá chúng, phần demo
   defense-in-depth trong báo cáo mất luôn dẫn chứng thực nghiệm.
+- **Đừng thêm lại giá trị mặc định cho `SESSION_SECRET`.** App cố ý từ chối
+  khởi động khi khóa thiếu, là giá trị mẫu hoặc < 32 ký tự
+  (`src/sessionSecret.js`). Trong Docker khóa là Docker secret
+  (`secrets/session_secret`, qua `SESSION_SECRET_FILE`), không phải biến môi
+  trường.
+- **Header bảo mật ở `src/httpHeaders.js`, cookie `secdb.sid` HttpOnly +
+  SameSite=Strict, cấp mã phiên mới khi đăng nhập.** Đừng nới CSP để thêm
+  script inline hay CDN; đừng bỏ `req.session.regenerate` ở `routes/auth.js`
+  (chống session fixation). Có phép thử trong mục "WEB" của `verify.sh`.
+- **Mọi request ghi (kể cả `/auth/login`) cần CSRF token + JSON**
+  (`src/csrf.js`). Lấy token qua `GET /auth/csrf`; đăng nhập trả token mới vì
+  phiên được cấp lại. Script hay client mới gọi app phải theo luồng này (xem
+  `demo-attack.sh`). Đừng thêm ngoại lệ "cho tiện test".
+- **Giới hạn đăng nhập sai ở `src/loginLimiter.js`** (5 lần/cặp IP+username,
+  100 lần/IP, cửa sổ 15 phút, bộ đếm trong bộ nhớ). Phép thử phải dùng
+  username ngẫu nhiên không tồn tại — khóa nhầm `hn01` là demo hỏng 15 phút.
+  Bị khóa khi đang làm: `docker compose restart app`.
 - **Không có `ENCRYPTION_KEY` trong `app/.env`.** `app/` chỉ gọi
   `app.encrypt_text()`/`app.decrypt_text()`/`app.blind_index()`, không bao giờ
   tự tay gọi `pgp_sym_encrypt`/`pgp_sym_decrypt` hay tự cầm khóa — khóa chỉ
@@ -361,6 +400,21 @@ thì `RETURNING` một hằng số), và không truy vấn được bảng để
 đã là giờ địa phương của server (`log_timezone`); `new Date()` sẽ quy đổi sang
 múi giờ của máy chạy analyzer và làm rule `AFTER_HOURS` lệch vài tiếng.
 
+**`--watch` không phải "gọi lại batch mỗi 2 giây".** Nó giữ MỘT
+`SessionTracker` suốt tiến trình (batch tạo tracker mới mỗi lần nên quên `SET
+ROLE` của lần trước — ranh giới hai lần đọc rơi vào giữa `SET LOCAL ROLE` và
+câu kế tiếp là quy nhầm cho `app_user`), không `flushAll()` mỗi nhịp (cắt ngang
+câu lệnh làm `BULK_DECRYPT` đếm thiếu — dùng `flushIdle()`), và đọc theo vị trí
+byte (`tail.js`). Rule và redact nằm chung ở `pipeline.js` cho cả hai chế độ.
+
+**Watch và batch không được ghi song song** — hai bên giữ vị trí đọc riêng nên
+sẽ ghi trùng. Watch giữ file khóa (PID); batch thấy watch sống thì thoát mã `3`
+không ghi, các script gọi analyzer phải hiểu mã này. `verify.sh` dùng
+`--dry-run --since=<mốc từ DB>` để không phụ thuộc file trạng thái.
+
+**pgAudit ghi `RESET ROLE` là `MISC,RESET`, không phải `MISC,SET`.** Xét đổi vai
+phải nhận cả hai command — xem mục `app/` về `RESET ROLE`.
+
 **Thiếu `secrets/` thì init sẽ fail.** Lần chạy đầu trên một máy mới phải
 `bash scripts/init-secrets.sh` trước (`scripts/reset.sh` đã tự gọi). Hàm đọc
 khóa cố ý `RAISE EXCEPTION` kèm HINT thay vì im lặng dùng khóa mặc định.
@@ -371,6 +425,41 @@ khóa cố ý `RAISE EXCEPTION` kèm HINT thay vì im lặng dùng khóa mặc �
 ```bash
 git diff --cached --name-only | grep -E '^\.env$|^secrets/'   # phải không ra gì
 ```
+
+## Docker cho app/, analyzer/, dashboard/ — quy ước
+
+- **Cấu hình qua `environment` trong compose, KHÔNG copy `.env` vào image.**
+  Mỗi thư mục có `.dockerignore` loại `.env`; `verify.sh` kiểm tra không image
+  nào chứa `/app/.env`.
+- **Container chạy bằng `USER node`**, không phải root (có phép thử).
+- **`app` và `dashboard` chỉ publish trên `127.0.0.1`.** Đừng đổi sang
+  `"3000:3000"` cho tiện — app có 2 lỗ hổng cố ý, dashboard không có đăng nhập.
+- **Log mount `:ro` cho analyzer** — log là bằng chứng (có phép thử).
+- **`analyzer/state/` dùng chung host ↔ container.** Watch trong container và
+  batch trên host cùng một file trạng thái + file khóa nhịp tim, nên chuyển
+  qua lại không ghi trùng. Script phát hiện service `analyzer` đang chạy thì
+  không chạy thêm analyzer trên host. `reset.sh` dọn thư mục này.
+- IP cố định trên dbnet: `.20` app, `.30` analyzer, `.40` dashboard — cột
+  `client` trong cảnh báo nhờ vậy chỉ ra nguồn câu lệnh.
+
+## dashboard/ — quy ước
+
+Đọc `dashboard/README.md` trước khi sửa.
+
+- **Chỉ kết nối bằng `dashboard_user`, chỉ đọc.** Mọi câu SQL nằm ở
+  `dashboard/server/alerts.js`. Đừng thêm nút "chạy analyzer" hay "đánh dấu đã
+  xử lý" bằng cách cấp thêm quyền — giữ đối xứng đọc/ghi ở mục "Schema".
+- **Poll theo `id`, không `LISTEN/NOTIFY`** (lý do ở mục "Schema").
+- **`detail` là dữ liệu không tin cậy** — `cau_lenh` do kẻ tấn công viết ra.
+  Chỉ render bằng text node của React, không `dangerouslySetInnerHTML`. Server
+  còn đặt CSP `script-src 'self'` làm lớp thứ hai; đừng nới nó để nhúng script
+  inline.
+- **Script npm gọi thẳng `node node_modules/<pkg>/bin/...`.** Đường dẫn repo có
+  ký tự `&` ("An toàn Web & CSDL"), shim `.cmd` của npm trên Windows cắt chuỗi
+  tại đó và báo `Cannot find module` trỏ tới `D:/Workspace/vite/bin/vite.js`. Đừng
+  "rút gọn" script về `vite build`.
+- Giờ hiển thị cố định `Asia/Ho_Chi_Minh`; `detail.thoi_diem` giữ nguyên chuỗi
+  từ log, không đưa qua `new Date()` (cùng lý do với analyzer).
 
 ## backup/ — quy ước (lớp 4)
 
@@ -400,7 +489,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 62 phép thử, phải đạt hết
+bash scripts/verify.sh         # 83 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

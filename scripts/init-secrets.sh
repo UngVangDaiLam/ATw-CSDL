@@ -59,9 +59,12 @@ make_secret() {
 echo "==> Sinh secret vao ./secrets/"
 make_secret secrets/pgcrypto_key "khoa ma hoa pgp_sym_encrypt"
 make_secret secrets/cccd_pepper  "pepper cho blind index HMAC"
+# Khoa ky cookie phien cua app/. Doi khoa nay chi lam moi nguoi phai dang nhap
+# lai - khong anh huong du lieu, khac voi hai khoa tren.
+make_secret secrets/session_secret "khoa ky cookie phien cua app/"
 
 echo
 echo "Xong. Kiem tra (KHONG in ra noi dung khoa):"
-for f in secrets/pgcrypto_key secrets/cccd_pepper; do
+for f in secrets/pgcrypto_key secrets/cccd_pepper secrets/session_secret; do
     printf '  %-26s %s byte\n' "$f" "$(wc -c < "$f" | tr -d ' ')"
 done

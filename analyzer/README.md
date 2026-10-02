@@ -3,10 +3,18 @@
 Đọc log JSON của PostgreSQL, quy trách nhiệm từng câu lệnh về đúng nhân viên,
 áp các rule phát hiện, rồi ghi cảnh báo vào `audit.alerts`.
 
-Chạy một lần rồi thoát. Muốn theo dõi liên tục thì gọi lại định kỳ — file trạng
-thái bảo đảm không sinh cảnh báo trùng.
+Hai chế độ: chạy một lần rồi thoát (batch), hoặc theo dõi liên tục (`--watch`)
+để cảnh báo hiện trên dashboard mà không ai phải gõ lệnh. Cả hai dùng chung rule
+và file trạng thái, chuyển qua lại không sinh cảnh báo trùng.
 
 ## Chạy
+
+Mặc định chạy trong Docker ở chế độ `--watch` (service `analyzer` của
+`docker-compose.yml`): log mount **chỉ đọc**, user `node` đọc được nhờ nhóm 999
+(xem CLAUDE.md "Bẫy 9"), trạng thái ở `analyzer/state/` dùng chung với bản
+chạy tay trên host. `docker compose logs -f analyzer` để xem.
+
+Chạy tay trên host:
 
 ```bash
 cd analyzer
@@ -15,13 +23,70 @@ cp .env.example .env          # sửa DB_PASSWORD cho khớp ANALYZER_PASSWORD t
 
 node src/index.js --dry-run --all   # xem thử, không ghi database
 node src/index.js                   # đọc phần log mới, ghi vào audit.alerts
+node src/index.js --watch           # theo dõi liên tục, Ctrl+C để dừng
 ```
 
 | Cờ | Tác dụng |
 |----|----------|
 | `--dry-run` | chỉ in ra màn hình, không ghi `audit.alerts`, không lưu trạng thái |
 | `--all` | bỏ qua file trạng thái, đọc lại toàn bộ log từ đầu |
-| `--quiet` | chỉ in phần tổng kết |
+| `--quiet` | không in chi tiết từng cảnh báo |
+| `--watch` | theo dõi liên tục, xem mục bên dưới |
+| `--interval=<ms>` | chu kỳ đọc của `--watch` (mặc định 2000, hoặc `WATCH_INTERVAL_MS`) |
+| `--since="YYYY-MM-DD HH:MM:SS"` | chỉ xét log từ thời điểm đó (giờ VN), bỏ qua file trạng thái. **Bắt buộc kèm `--dry-run`** — dành cho `verify.sh` |
+
+Mã thoát: `0` xong, `1` lỗi, `3` = đang có `--watch` chạy nên lần batch này
+**nhường, không ghi** (xem "Không chạy song song" bên dưới).
+
+## Chế độ theo dõi liên tục (`--watch`)
+
+Cảnh báo vào `audit.alerts` sau **1–4 giây** kể từ lúc hành vi xảy ra (đo thật:
+`UNION SELECT` ~1 giây; giải mã hàng loạt 2.001 bản ghi ~4 giây, vì phải chờ một
+nhịp im lặng để chắc đã gom đủ các dòng lồng nhau).
+
+**Không phải "gọi lại batch mỗi 2 giây"** — làm vậy sẽ sai:
+
+- **Mất danh tính.** Mỗi lần chạy batch tạo `SessionTracker` mới, quên mất
+  `SET ROLE` của lần trước. Ranh giới hai lần đọc rơi vào giữa `SET LOCAL ROLE
+  nv_hn01` và câu `SELECT` ngay sau nó là câu đó bị quy cho `app_user`. Watch
+  giữ **một** tracker suốt tiến trình.
+- **Tách đôi câu lệnh.** Batch `flushAll()` ở cuối file — cắt ngang một câu
+  đang ghi dở thì đếm trùng, hoặc chia đôi số bản ghi bị giải mã và
+  `BULK_DECRYPT` bỏ sót. Watch chỉ coi một câu là xong khi phiên đó **không có
+  dòng mới nào trong cả một nhịp** (`sessions.js` `flushIdle()`).
+- **Quét lại cả file.** `logReader.js` bỏ qua phần đã đọc bằng cách đếm dòng từ
+  đầu file (có file 26 MB). Watch nhớ vị trí **byte** và chỉ đọc phần mới
+  (`tail.js`).
+
+**Lưu trạng thái an toàn.** Chỉ lưu khi mọi cảnh báo đã ghi xong, và không lưu
+vượt qua dòng đầu của câu lệnh còn đang gom dở. File được ghi ra file tạm rồi
+đổi tên, nên dừng giữa chừng cũng không làm hỏng nó. Bị kill đột ngột thì lần
+sau đọc lại một đoạn — có thể trùng vài cảnh báo, không bao giờ mất (cùng
+nguyên tắc với batch: thà trùng còn hơn sót).
+
+**Database chết thì không chết theo.** Cảnh báo được giữ trong hàng đợi, thử
+lại mỗi nhịp, ghi đúng một lần khi DB sống lại. Lỗi chỉ in một lần, không spam.
+Đã thử: restart PostgreSQL khi đang giữ kết nối mở, và tắt hẳn DB ngay sau một
+lần tấn công — không mất, không trùng. PostgreSQL tạo file log mới sau mỗi lần
+khởi động lại; watch tự chuyển sang file đó.
+
+**Không chạy song song với batch.** Watch giữ vị trí đọc trong bộ nhớ, batch
+đọc từ file trạng thái — chạy cùng lúc thì cả hai xử lý một đoạn log và **ghi
+trùng** (đã tái hiện: một câu `UNION` ra 6 cảnh báo thay vì 3). Watch ghi PID
+vào `.analyzer-state.json.watch.lock`; batch thấy watch còn sống thì thoát mã
+`3` mà không ghi. `gen-alerts.sh` và `demo-attack.sh` hiểu mã này và chờ watch
+tự ghi. Watch thứ hai cũng bị từ chối. Watch bị kill cưỡng bức thì file khóa
+còn đó nhưng PID đã chết → tự coi như bỏ, không ai phải xóa tay. `--dry-run`
+không ghi gì nên vẫn chạy được.
+
+`verify.sh` dùng `--dry-run --since=<mốc lấy từ database>` thay vì đọc tiếp
+từ file trạng thái: nếu không, một watch đang chạy có thể đã lưu vị trí vượt
+qua các câu tấn công mà verify vừa tạo, và dry-run không thấy gì.
+
+**Giới hạn:** vai đã `SET ROLE` của một phiên chỉ nằm trong bộ nhớ. Khởi động
+lại watch giữa chừng một phiên đang mở thì các câu sau đó của phiên ấy bị quy
+cho session user tới lần `SET ROLE` kế tiếp. Với `app/` mỗi request đều `SET
+LOCAL ROLE` lại nên lệch tối đa một request.
 
 Đọc cảnh báo đã ghi (cần superuser — `analyzer_user` không có `SELECT`):
 
@@ -106,6 +171,22 @@ Tức là dùng chính sự tách bạch giữa *session user* và *vai đã SET
 1 tạo ra để phân loại hành vi — điều mà nhìn vào cột `user` của log thô không
 bao giờ làm được.
 
+**Điều kiện để lập luận trên đúng: app phải `RESET ROLE` sau mỗi request.**
+`app/` dùng `SET LOCAL ROLE`, tự hết hiệu lực khi `COMMIT` — nhưng pgAudit
+**không ghi `COMMIT`**, nên analyzer không biết vai đã hết. Connection pool lại
+tái sử dụng kết nối: request của `nv_hn01` xong, cùng kết nối đó phục vụ lượt
+đăng nhập của `dn01` (đọc `app.staff`, không `SET ROLE`) → analyzer vẫn tưởng
+vai `nv_hn01` còn hiệu lực → **cảnh báo `STAFF_CREDENTIAL_READ` 75 điểm giả,
+gán nhầm người**. Đã tái hiện được lỗi này qua app thật.
+
+Cách sửa: `app/src/middleware/setRole.js` gọi `RESET ROLE` sau mỗi
+`COMMIT`/`ROLLBACK`. Câu đó không đổi gì trong database (vai đã hết từ trước)
+nhưng vào log, là mốc để analyzer trả vai. Lưu ý pgAudit ghi nó thành
+**`MISC,RESET`**, không phải `MISC,SET` — `sessions.js` phải nhận cả hai, thiếu
+là lỗi vẫn nguyên mà không có dấu hiệu gì. `verify.sh` có cặp phép thử: một
+phép **đối chứng** (thiếu `RESET ROLE` → gán nhầm thật, chứng minh phép thử
+không vô nghĩa) và một phép thử chính (có `RESET ROLE` → không gán nhầm).
+
 ## Cảnh báo không được chứa dữ liệu thật
 
 `pgaudit.log_parameter = off` nên tham số của prepared statement không bị ghi.
@@ -165,7 +246,8 @@ Ghi rõ trong báo cáo, đừng để người chấm tự phát hiện:
 
 ```
 logs/*.json
-   │  logReader.js    đọc theo dòng (stream), bỏ qua phần đã xử lý
+   │  logReader.js    batch: đọc theo dòng (stream), bỏ qua phần đã xử lý
+   │  tail.js         watch: đọc tăng dần theo vị trí byte, chỉ phần mới ghi
    ▼
 auditLine.js          tách trường CSV bên trong `message` của pgAudit
    │
@@ -181,6 +263,10 @@ redact.js             che dữ liệu nhạy cảm trong câu lệnh
    ▼
 alerts.js             INSERT vào audit.alerts bằng analyzer_user
 ```
+
+`index.js` là điểm vào (batch), `watch.js` là vòng lặp của `--watch`;
+`pipeline.js` chứa phần hai chế độ dùng chung (đánh giá rule, in, đọc/ghi
+trạng thái) để một rule sửa ở chế độ này không lặng lẽ khác ở chế độ kia.
 
 ## Liên quan
 

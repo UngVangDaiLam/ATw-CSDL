@@ -19,9 +19,16 @@ cd "$(dirname "$0")/.." || exit 1
 [ -f .env ] || { echo "Khong tim thay .env"; exit 1; }
 set -a; . ./.env; set +a
 
-command -v node >/dev/null     || { echo "Can Node.js de chay analyzer."; exit 1; }
-[ -d analyzer/node_modules ]   || { echo "Chua cai phu thuoc: cd analyzer && npm install"; exit 1; }
-[ -f analyzer/.env ]           || { echo "Thieu analyzer/.env - copy tu analyzer/.env.example"; exit 1; }
+# Service analyzer của docker compose đang chạy (--watch) thì nó tự ghi cảnh
+# báo - không cần, và KHÔNG được, chạy thêm analyzer trên host.
+ANALYZER_IN_DOCKER=""
+docker compose ps --status running --services 2>/dev/null | grep -qx analyzer && ANALYZER_IN_DOCKER=1
+
+if [ -z "$ANALYZER_IN_DOCKER" ]; then
+    command -v node >/dev/null     || { echo "Can Node.js de chay analyzer (hoac: docker compose up -d analyzer)."; exit 1; }
+    [ -d analyzer/node_modules ]   || { echo "Chua cai phu thuoc: cd analyzer && npm install"; exit 1; }
+    [ -f analyzer/.env ]           || { echo "Thieu analyzer/.env - copy tu analyzer/.env.example"; exit 1; }
+fi
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
 # Chạy dưới danh tính một nhân viên, như backend làm cho mỗi request.
@@ -47,8 +54,20 @@ as_nv nv_dn01 'SELECT id, amount, card_last4 FROM app.payments;'
 # Log collector ghi ra file theo lô - chờ một nhịp cho chắc dòng cuối đã xuống đĩa.
 sleep 2
 
-echo "==> Chay analyzer (ghi that vao audit.alerts)"
-(cd analyzer && node src/index.js)
+if [ -n "$ANALYZER_IN_DOCKER" ]; then
+    echo "==> analyzer dang chay trong Docker, tu ghi canh bao - cho mot nhip..."
+    sleep 6
+else
+    echo "==> Chay analyzer (ghi that vao audit.alerts)"
+    # Ma 3: analyzer --watch dang chay tren host va se tu ghi - lan batch nay
+    # nhuong de khong ghi trung (xem analyzer/src/pipeline.js).
+    rc=0; (cd analyzer && node src/index.js) || rc=$?
+    if [ "$rc" -eq 3 ]; then
+        echo "    Cho analyzer --watch ghi canh bao..."; sleep 6
+    elif [ "$rc" -ne 0 ]; then
+        exit "$rc"
+    fi
+fi
 
 echo "==> Canh bao muc cam/do moi nhat (doc bang dashboard_user):"
 docker compose exec -T postgres psql \

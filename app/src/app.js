@@ -1,21 +1,49 @@
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const session = require('express-session');
 const pool = require('./db');
 const authRoutes = require('./routes/auth');
 const customerRoutes = require('./routes/customers');
 const orderRoutes = require('./routes/orders');
+const { loadSessionSecret } = require('./sessionSecret');
+
+let sessionSecret;
+try {
+  sessionSecret = loadSessionSecret();
+} catch (err) {
+  console.error(`[app] KHONG KHOI DONG: ${err.message}`);
+  process.exit(1);
+}
+
+const { securityHeaders, noStore } = require('./httpHeaders');
 
 const app = express();
-app.use(express.json());
+// Khong quang cao "X-Powered-By: Express" cho ai do phien ban.
+app.disable('x-powered-by');
+app.use(securityHeaders);
+// Body JSON toi da 10 KB - du cho moi form cua app, chan request phinh to.
+app.use(express.json({ limit: '10kb' }));
 
 // Session luu trong memory - du dung cho demo. Khong dung trong production
 // (mat session khi restart, khong scale duoc nhieu instance).
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || 'doi_chuoi_bi_mat_nay',
+    // Ten rieng thay cho "connect.sid" mac dinh (lo ra dung express-session).
+    name: 'secdb.sid',
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, maxAge: 1000 * 60 * 60 }, // 1 gio
+    // Moi request gia han them 30 phut; ngoi im qua 30 phut thi het phien.
+    rolling: true,
+    cookie: {
+      httpOnly: true,       // JavaScript tren trang khong doc duoc cookie (XSS khong lay duoc phien)
+      sameSite: 'strict',   // trinh duyet khong gui cookie theo request tu trang khac (CSRF)
+      // Chi gui qua HTTPS. Lab chay http://127.0.0.1 nen mac dinh tat; dat
+      // COOKIE_SECURE=true khi co HTTPS that phia truoc.
+      secure: process.env.COOKIE_SECURE === 'true',
+      maxAge: 1000 * 60 * 30,
+    },
   })
 );
 
@@ -32,8 +60,25 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.use('/auth', authRoutes);
-app.use('/customers', customerRoutes);
-app.use('/orders', orderRoutes);
+// Moi request ghi du lieu: phai la JSON va mang CSRF token dung (src/csrf.js).
+const { requireJson, verifyCsrf } = require('./csrf');
+app.use(requireJson);
+app.use(verifyCsrf);
+
+app.use('/auth', noStore, authRoutes);
+app.use('/customers', noStore, customerRoutes);
+app.use('/orders', noStore, orderRoutes);
+
+// Giao dien web (web/ -> npm run build -> public/). Phuc vu CUNG origin voi
+// API: dieu kien de cookie SameSite=Strict va CSRF token hoat dong ma khong can
+// bat CORS. Dat SAU cac route API nen khong che duoc duong dan API nao.
+const publicDir = path.join(__dirname, '..', 'public');
+if (fs.existsSync(path.join(publicDir, 'index.html'))) {
+  app.use(express.static(publicDir));
+} else {
+  app.get('/', (req, res) =>
+    res.type('text').send('Chua build giao dien. Chay: npm run build (hoac docker compose up -d --build app)')
+  );
+}
 
 module.exports = app;

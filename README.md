@@ -36,7 +36,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 97 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 103 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -74,7 +74,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
-│       └── rules/          # 8 rule trên log pgAudit + 2 rule tầng web
+│       └── rules/          # 9 rule trên log pgAudit + 2 rule tầng web
 └── dashboard/              # React + Socket.IO, đọc audit.alerts bằng dashboard_user - xem dashboard/README.md
 ```
 
@@ -339,7 +339,7 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
 bash scripts/verify.sh
 ```
 
-Chạy 97 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 103 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
@@ -450,7 +450,7 @@ cd app && npm install && cp .env.example .env && npm run dev
 ## 7b. `analyzer/` — lớp 3
 
 Đọc `logs/*.json`, bám `session_id` để quy trách nhiệm cho đúng nhân viên theo
-`SET ROLE`, áp 8 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
+`SET ROLE`, áp 9 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
 `analyzer_user` (chỉ `INSERT`).
 
 Chạy sẵn trong Docker ở chế độ `--watch` (service `analyzer`): mọi hành vi
@@ -563,7 +563,8 @@ tầng database vẫn giữ — bài thực nghiệm trung tâm cho luận đi�
 | 3 | SQLi UNION đọc `app.staff.password_hash` | Quyền mức cột (`staff` không bật RLS) | **Bị chặn**: `permission denied for table staff`. Trước khi có quyền mức cột thì lộ hash của cả 3 chi nhánh. |
 | 3b | SQLi UNION đọc `app.customers` chi nhánh khác | RLS (FORCE) + mã hóa cột | Chỉ kéo được chi nhánh mình; `cccd` là ciphertext `\x…` |
 | 4 | IDOR `/orders/:id` chi nhánh khác | RLS `branch_isolation` | `404` dù code không kiểm tra quyền |
-| 5–6 | (log các hành vi trên) | pgAudit + analyzer | `SQLI_UNION`, `ACCESS_DENIED` (lần thử bị chặn)… quy về đúng `nv_hn01` |
+| 4b | `admin_user` bị chiếm: `SET ROLE db_owner`, tắt RLS, `GRANT ... TO PUBLIC`, hàm `SECURITY DEFINER`, thử `SUPERUSER` | Lớp 1 **không** chặn (chủ sở hữu có quyền) — trừ `SUPERUSER` bị từ chối | Chỉ lớp 3 thấy: `PRIVILEGE_ESCALATION`. Chạy trong transaction rồi `ROLLBACK`. |
+| 5–6 | (log các hành vi trên) | pgAudit + analyzer | `SQLI_UNION`, `ACCESS_DENIED` (lần thử bị chặn), `PRIVILEGE_ESCALATION`… quy về đúng người |
 
 Script tự khởi động `app/` nếu chưa chạy (và tự tắt khi xong), chạy analyzer,
 rồi đọc cảnh báo bằng `dashboard_user`. Mở `dashboard/` song song để xem cảnh

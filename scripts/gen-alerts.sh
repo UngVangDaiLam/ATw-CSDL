@@ -54,6 +54,11 @@ as_nv nv_hn01 "SELECT c.full_name, t.table_name FROM app.customers c, informatio
 echo "    nv_dn01 : doc toan bang payments khong WHERE    -> FULL_TABLE_READ"
 as_nv nv_dn01 'SELECT id, amount, card_last4 FROM app.payments;'
 
+# ROLLBACK: chi de lai dau vet trong log, khong de lai thay doi trong DB.
+echo "    admin_user bi chiem: tat RLS, GRANT PUBLIC (ROLLBACK) -> PRIVILEGE_ESCALATION"
+printf "BEGIN;\nSET LOCAL ROLE db_owner;\nALTER TABLE app.customers NO FORCE ROW LEVEL SECURITY;\nGRANT SELECT ON app.customers TO PUBLIC;\nROLLBACK;\nRESET ROLE;\n" \
+    | docker compose exec -T postgres psql "postgresql://admin_user:${ADMIN_PASSWORD}@172.28.0.10:5432/secdb" -q >/dev/null 2>&1 || true
+
 # Log collector ghi ra file theo lô - chờ một nhịp cho chắc dòng cuối đã xuống đĩa.
 sleep 2
 

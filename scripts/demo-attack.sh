@@ -6,7 +6,8 @@
 #   bash scripts/demo-attack.sh --yes    (chạy một mạch)
 #
 # Diễn lại HAI lỗ hổng CỐ Ý ở tầng ứng dụng (SQL Injection + IDOR, xem
-# app/README.md) qua đúng HTTP endpoint của app/, rồi cho thấy các lớp phòng
+# app/README.md) qua đúng HTTP endpoint của app/, cộng một kịch bản tài khoản
+# quản trị bị chiếm (bước 4b, ROLLBACK nên không để lại gì), rồi cho thấy các lớp phòng
 # thủ ở tầng DATABASE vẫn giữ: RLS chặn rò dữ liệu chi nhánh khác, mã hóa cột
 # giữ CCCD/thẻ dù bảng bị dump. Cuối cùng chạy analyzer (lớp 3) để chứng minh
 # hành vi bất thường bị ghi nhận và hiện lên dashboard.
@@ -220,6 +221,27 @@ info "=> Lop 1 (RLS) bien mot IDOR kinh dien thanh vo hai, khong can sua code."
 pause
 
 # -----------------------------------------------------------------------------
+step "4b. TAN CONG 3 - tai khoan quan tri (admin_user) bi chiem"
+info "Khong can lo hong nao: admin_user SET ROLE db_owner - chu so huu moi bang -"
+info "roi go lop bao ve bang chinh cau lenh HOP LE. Lop 1 khong chan duoc vi"
+info "chu so huu CO quyen lam vay. Chi con lop 3 nhin thay."
+info "(Chay trong transaction roi ROLLBACK - demo khong de lai thay doi.)"
+cmd "SET LOCAL ROLE db_owner"
+cmd "ALTER TABLE app.customers NO FORCE ROW LEVEL SECURITY"
+cmd "GRANT SELECT ON app.customers TO PUBLIC"
+cmd "CREATE FUNCTION app.cua_hau() ... SECURITY DEFINER"
+printf "BEGIN;\nSET LOCAL ROLE db_owner;\nALTER TABLE app.customers NO FORCE ROW LEVEL SECURITY;\nGRANT SELECT ON app.customers TO PUBLIC;\nCREATE FUNCTION app.cua_hau() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';\nROLLBACK;\nRESET ROLE;\n" \
+    | docker compose exec -T postgres psql "postgresql://admin_user:${ADMIN_PASSWORD}@172.28.0.10:5432/secdb" -q 2>&1 | sed 's/^/     /'
+info "Buoc tiep theo cua ke tan cong - tu cap SUPERUSER cho minh:"
+cmd "ALTER ROLE admin_user SUPERUSER"
+ESC=$(docker compose exec -T postgres psql "postgresql://admin_user:${ADMIN_PASSWORD}@172.28.0.10:5432/secdb" -tAc 'ALTER ROLE admin_user SUPERUSER;' 2>&1 | head -1)
+good "BI CHAN: ${ESC#ERROR:  }"
+info "admin_user tao ra NOSUPERUSER NOCREATEROLE (02_roles.sh) - khong tu nang quyen duoc."
+info "=> Ca lan thanh cong (tat RLS, GRANT PUBLIC, ham SECURITY DEFINER) lan lan"
+info "   bi chan (SUPERUSER) deu vao log - buoc 6 se thay PRIVILEGE_ESCALATION."
+pause
+
+# -----------------------------------------------------------------------------
 step "5. Lop 3 - cac hanh vi tren da vao log, analyzer co bat duoc khong?"
 sleep 2
 if docker compose ps --status running --services 2>/dev/null | grep -qx analyzer; then
@@ -251,10 +273,12 @@ dash_sql -c "SELECT id, db_user, rule_triggered, risk_score,
                     left(detail->>'mo_ta', 48) AS mo_ta
              FROM audit.alerts
              WHERE id > ${MAX0:-0} AND rule_triggered <> 'AFTER_HOURS'
-             ORDER BY risk_score DESC, id LIMIT 8;"
+             ORDER BY risk_score DESC, id LIMIT 12;"
 good "SQLi -> SQLI_UNION + ACCESS_DENIED, quy ve dung nv_hn01 (nho SET ROLE)."
 info "Cau UNION bi chan van de lai dong ERROR 42501 trong log - analyzer doc no"
 info "nen lan tan cong that bai van bi goi ten, khong vo hinh voi lop 3."
+good "admin_user bi chiem -> PRIVILEGE_ESCALATION (tat RLS, GRANT PUBLIC, SECURITY"
+info "DEFINER, thu SUPERUSER) - cau lenh hop le ma lop 1 khong chan, lop 3 van goi ten."
 info "Luu y trung thuc: analyzer KHONG bat duoc IDOR o buoc 4 - no chi doc duoc"
 info "cau lenh trong log, ma IDOR la truy van hop le ve mat cu phap (xem"
 info "analyzer/README.md muc gioi han). Chinh RLS moi la thu chan IDOR."

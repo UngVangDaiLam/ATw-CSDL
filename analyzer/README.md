@@ -161,6 +161,7 @@ cùng `statement_id` — cũng phải gom lại, nếu không sẽ đếm trùng
 | `SQLI_UNION` | 90 | câu lệnh chứa `UNION ... SELECT` — dấu vết khai thác đọc sang bảng khác |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã ≥ `BULK_DECRYPT_THRESHOLD` bản ghi (điểm tăng theo khối lượng) |
 | `SQLI_TAUTOLOGY` | 85 | điều kiện luôn đúng kiểu `OR 1=1`, `OR 'a'='a'` |
+| `PRIVILEGE_ESCALATION` | 75–95 | leo thang đặc quyền / gỡ lớp bảo vệ bằng câu lệnh hợp lệ (class `ROLE`/`DDL`), kể cả lần thử bị từ chối — chi tiết bên dưới |
 | `ACCESS_DENIED` | 65–85 | câu lệnh bị PostgreSQL **từ chối quyền** (SQLSTATE `42501`); 85 nếu nhắm vào `password_hash` / `app.staff` |
 | `STAFF_CREDENTIAL_READ` | 75 | đọc `app.staff` **từ phiên đã `SET ROLE`** |
 | `SQLI_SCHEMA_PROBE` | 70 | truy vấn `pg_catalog` / `information_schema` từ phiên ứng dụng |
@@ -205,6 +206,41 @@ vẫn là khai thác.
 
 Rule này cũng bắt cả các phép thử âm của `verify.sh` (`DROP TABLE`, `DELETE`…
 bằng `app_user`) — đúng, đó là những lần thử thật bị từ chối.
+
+### `PRIVILEGE_ESCALATION` — tài khoản quản trị bị chiếm
+
+`admin_user` và `db_owner` đăng nhập được qua TCP. `admin_user` không phải
+superuser, nhưng `SET ROLE db_owner` là thành chủ sở hữu mọi bảng — và chủ sở
+hữu **có quyền** tắt RLS, xóa policy, `GRANT` cho `PUBLIC`, tạo hàm `SECURITY
+DEFINER`. Lớp 1 không chặn được vì đó là câu lệnh hợp lệ; chỉ lớp 3 nhìn thấy.
+pgAudit đã ghi chúng nhờ class `role` + `ddl` trong `pgaudit.log`.
+
+| Hành vi | Điểm | Nhận diện (theo `command` + câu lệnh) |
+|---|---|---|
+| Thuộc tính role nguy hiểm | 95 | `ALTER/CREATE ROLE ... SUPERUSER / CREATEROLE / CREATEDB / BYPASSRLS / REPLICATION` |
+| Đổi cấu hình pgAudit | 95 | `SET` / `ALTER SYSTEM` / `ALTER ROLE` / `ALTER DATABASE` chạm `pgaudit.*` |
+| Cấp role thành viên | 90 | `GRANT <role> TO ...` (command `GRANT ROLE`) |
+| Tắt RLS | 90 | `ALTER TABLE ... DISABLE / NO FORCE ROW LEVEL SECURITY` |
+| Xóa/sửa policy | 85 | `DROP POLICY`, `ALTER POLICY` |
+| Cấp quyền cho PUBLIC | 85 | `GRANT ... TO PUBLIC` |
+| Hàm `SECURITY DEFINER` | 80 | `CREATE/ALTER FUNCTION/PROCEDURE ... SECURITY DEFINER` |
+| Default privileges cho bảng | 75 | `ALTER DEFAULT PRIVILEGES ... GRANT ... ON TABLES` (repo cố ý tránh) |
+
+Mỗi mẫu gắn với `command` của chính dòng log, không chỉ tìm chuỗi — client gửi
+nhiều câu trong một chuỗi thì dòng AUDIT của mọi câu đều chứa cả chuỗi.
+
+Lần **thử** vượt quyền hạn (`ALTER ROLE admin_user SUPERUSER` của một role
+không phải superuser) bị PostgreSQL từ chối, không có dòng AUDIT — đi vào qua
+nhánh `DENIED` giống `ACCESS_DENIED`, `mo_ta` ghi thêm `(BI TU CHOI)`.
+
+Giới hạn:
+- Phiên qua unix socket (superuser trong container) bị bỏ qua theo
+  `IGNORE_LOCAL_SOCKET`. Ai có shell trong container database đã ra ngoài mô
+  hình này.
+- Quy trách nhiệm dựa trên `SET ROLE` như mọi rule khác: dùng `SET LOCAL ROLE`
+  mà không `RESET ROLE` sau `ROLLBACK`/`COMMIT` thì câu kế tiếp trong cùng phiên
+  vẫn bị quy cho vai cũ (pgAudit không ghi `COMMIT`). Cột `session_user` của
+  cảnh báo vẫn là role đã đăng nhập thật (`admin_user`).
 
 ### Vì sao `STAFF_CREDENTIAL_READ` không báo động giả lúc đăng nhập
 

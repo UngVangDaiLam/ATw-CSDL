@@ -13,6 +13,7 @@ module.exports = [
   require('./sqlInjection'),
   require('./staffCredentialRead'),
   require('./accessDenied'),
+  require('./privilegeEscalation'),
   require('./bulkDecrypt'),
   require('./fullTableRead'),
   require('./afterHours'),

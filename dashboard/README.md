@@ -101,6 +101,7 @@ Các rule và gợi ý màu:
 | `SQLI_UNION` | 90 | câu lệnh có `UNION ... SELECT` |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã hàng loạt CCCD |
 | `SQLI_TAUTOLOGY` | 85 | `OR 1=1`, `OR 'a'='a'` |
+| `PRIVILEGE_ESCALATION` | 75–95 | tắt RLS, xóa policy, `GRANT ... TO PUBLIC`, cấp role, hàm `SECURITY DEFINER`, thuộc tính `SUPERUSER`/`BYPASSRLS`, đổi cấu hình pgAudit |
 | `ACCESS_DENIED` | 65–85 | câu lệnh bị PostgreSQL từ chối quyền (85 nếu nhắm vào `password_hash` / `app.staff`) |
 | `STAFF_CREDENTIAL_READ` | 75 | nhân viên đọc bảng chứa `password_hash` |
 | `SQLI_SCHEMA_PROBE` | 70 | dò `information_schema` / `pg_catalog` |

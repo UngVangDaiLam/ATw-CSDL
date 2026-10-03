@@ -259,6 +259,15 @@ else
     }
     login_after_request "" "verify_khong_reset"
     login_after_request "RESET ROLE;" "verify_co_reset"
+
+    # Leo thang dac quyen: admin_user bi chiem, SET ROLE db_owner (chu so huu
+    # moi bang) roi go lop bao ve bang cau lenh HOP LE - khong can lo hong nao.
+    # Chay trong transaction roi ROLLBACK nen khong de lai thay doi; pgAudit
+    # ghi luc thuc thi nen ROLLBACK khong xoa duoc dau vet.
+    printf "BEGIN;\nSET LOCAL ROLE db_owner;\nALTER TABLE app.customers NO FORCE ROW LEVEL SECURITY;\nGRANT SELECT ON app.customers TO PUBLIC;\nCREATE FUNCTION app.verify_cua_hau() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';\nROLLBACK;\nRESET ROLE;\n" \
+        | docker compose exec -T postgres psql "postgresql://admin_user:${ADMIN_PASSWORD}@172.28.0.10:5432/secdb" -q >/dev/null 2>&1
+    # Vuot quyen han cua role -> PostgreSQL tu choi, chi con dong ERROR 42501.
+    sql_app 'ALTER ROLE app_user SUPERUSER;' >/dev/null
     sleep 2
 
     # --dry-run: lan chay NAY khong tu ghi vao audit.alerts. Nhung neu service
@@ -273,6 +282,16 @@ else
     # Tan cong bi lop 1 chan van phai hien o lop 3, va van quy dung nguoi.
     expect "analyzer bat lan SQLi bi tu choi quyen, quy cho nv_hcm01 (ACCESS_DENIED)" "nv_hcm01" \
            "$(printf '%s' "$ANALYZER_OUT" | grep 'ACCESS_DENIED')"
+    # Moi canh bao in 3 dong (diem/rule/nguoi, mo ta, cau lenh) - lay ca khoi.
+    PRIV_OUT="$(printf '%s' "$ANALYZER_OUT" | grep -A2 'PRIVILEGE_ESCALATION')"
+    expect "analyzer bat tat RLS (NO FORCE ROW LEVEL SECURITY)" "NO FORCE ROW LEVEL SECURITY" "$PRIV_OUT"
+    expect "analyzer bat GRANT ... TO PUBLIC" "TO PUBLIC" "$PRIV_OUT"
+    expect "analyzer bat tao ham SECURITY DEFINER moi" "verify_cua_hau" "$PRIV_OUT"
+    expect "leo thang qua admin_user quy cho vai db_owner da SET ROLE" "db_owner" "$PRIV_OUT"
+    expect "lan THU ALTER ROLE ... SUPERUSER bi tu choi van bi bat" "(BI TU CHOI)" "$PRIV_OUT"
+    FORCE_RLS="$(sql_su "SELECT relforcerowsecurity FROM pg_class WHERE oid = 'app.customers'::regclass;" | tr -d '[:space:]')"
+    if [ "$FORCE_RLS" = "t" ]; then ok "sau ROLLBACK app.customers van FORCE RLS (phep thu khong de lai thay doi)"
+    else bad "sau ROLLBACK app.customers van FORCE RLS (phep thu khong de lai thay doi)" "t" "$FORCE_RLS"; fi
     # Diem mau chot cua ca lop 3: log tho chi ghi "app_user", canh bao phai goi
     # duoc ten nhan vien that nho bam theo SET ROLE trong tung phien.
     expect "canh bao quy trach nhiem cho nv_hcm01 (khong phai app_user)" "nv_hcm01" "$ANALYZER_OUT"

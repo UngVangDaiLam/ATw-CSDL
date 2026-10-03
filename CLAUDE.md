@@ -14,10 +14,10 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | **Xong** (8 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`) |
+| 3 | `pgAudit` + analyzer tự viết | **Xong** (9 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`) |
 | 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (97 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (103 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -438,6 +438,14 @@ trước hook của pgAudit, nên log chỉ có dòng `ERROR` với `state_code 
 `sessions.js` bắt riêng dòng này (class `DENIED`, rule `ACCESS_DENIED`). Đừng bỏ
 — thiếu nó thì SQLi đọc `password_hash` (giờ bị chặn) biến mất khỏi lớp 3.
 
+**`PRIVILEGE_ESCALATION` dựa vào class `role` + `ddl` trong `pgaudit.log`.**
+Gỡ hai class đó cho log gọn là lớp 3 mù trước kịch bản `admin_user` bị chiếm
+(tắt RLS, `GRANT ... TO PUBLIC`, hàm `SECURITY DEFINER` — đều là câu lệnh hợp
+lệ của chủ sở hữu, lớp 1 không chặn). Mẫu nhận diện phải gắn với `command` của
+dòng log, đừng chỉ tìm chuỗi (cùng lý do với nhiều câu trong một chuỗi ở trên).
+Phép thử trong `verify.sh` chạy trong transaction rồi `ROLLBACK` — đừng bỏ
+`ROLLBACK`, nếu không mỗi lần nghiệm thu là một lần tắt RLS thật.
+
 **Thiếu `secrets/` thì init sẽ fail.** Lần chạy đầu trên một máy mới phải
 `bash scripts/init-secrets.sh` trước (`scripts/reset.sh` đã tự gọi). Hàm đọc
 khóa cố ý `RAISE EXCEPTION` kèm HINT thay vì im lặng dùng khóa mặc định.
@@ -520,7 +528,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 97 phép thử, phải đạt hết
+bash scripts/verify.sh         # 103 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

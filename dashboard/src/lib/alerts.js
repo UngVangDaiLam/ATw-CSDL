@@ -24,6 +24,11 @@ export const RULES = {
     label: 'Đọc mật khẩu nhân viên',
     hint: 'Phiên nhân viên đọc app.staff — bảng chứa password_hash',
   },
+  PRIVILEGE_ESCALATION: {
+    score: 95,
+    label: 'Leo thang đặc quyền',
+    hint: 'Tắt RLS, GRANT cho PUBLIC, cấp role, tạo hàm SECURITY DEFINER, gán SUPERUSER… (75–95; ghi "BI TU CHOI" nếu PostgreSQL đã chặn)',
+  },
   ACCESS_DENIED: {
     score: 85,
     label: 'Bị từ chối quyền',

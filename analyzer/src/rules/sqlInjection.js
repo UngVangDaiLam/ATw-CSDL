@@ -34,7 +34,9 @@ module.exports = {
 
   run(stmt) {
     // Chi soi cau lenh doc/ghi du lieu. DDL cua quan tri vien khong tinh.
-    if (stmt.class !== 'READ' && stmt.class !== 'WRITE') return null;
+    // DENIED = cau lenh bi tu choi quyen (xem accessDenied.js): khai thac that
+    // bai van la khai thac, van phai goi dung ten SQLI_*.
+    if (stmt.class !== 'READ' && stmt.class !== 'WRITE' && stmt.class !== 'DENIED') return null;
 
     for (const p of PATTERNS) {
       if (p.re.test(stmt.statement)) {

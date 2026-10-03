@@ -1,10 +1,10 @@
 // RULE: doc bang chua thong tin dang nhap tu mot phien nhan vien.
 //
-// app.staff giu username va password_hash (bcrypt). app_user CO quyen SELECT
-// tren toan bo bang nay - bat buoc, vi chinh luong dang nhap phai tra ra
-// password_hash de so sanh (app/src/routes/auth.js). Va app.staff KHONG bat
-// RLS, nen day la muc tieu that su cua demo SQL Injection: du dang SET ROLE
-// sang chi nhanh nao, doc app.staff van ra toan bo nhan vien.
+// app.staff giu username va password_hash (bcrypt). app_user/staff_role chi
+// co SELECT tren cac cot KHAC password_hash (04_grants.sql) - doc password_hash
+// bi tu choi va do rule ACCESS_DENIED bat. Nhung app.staff KHONG bat RLS, nen
+// cac cot con lai (username, db_user) van doc duoc qua SQL Injection: du dang
+// SET ROLE sang chi nhanh nao, doc app.staff van ra toan bo nhan vien.
 //
 // Cach phan biet truy cap hop le voi truy cap dang ngo, KHONG phai bang cau
 // lenh ma bang DANH TINH luc chay:

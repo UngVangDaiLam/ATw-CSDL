@@ -46,7 +46,20 @@ GRANT SELECT, INSERT, UPDATE ON app.payments  TO app_user;
 
 -- Bảng tham chiếu: chỉ đọc
 GRANT SELECT ON app.branches TO app_user;
-GRANT SELECT ON app.staff    TO app_user;
+
+-- app.staff: quyền mức CỘT, cố ý BỎ `password_hash`.
+-- Bảng này không bật RLS, nên trước đây SQL Injection kiểu UNION ở
+-- /customers/search đọc được hash mật khẩu của cả ba chi nhánh. Giờ câu đó bị
+-- chính PostgreSQL từ chối ("permission denied for table staff"), dù lỗ hổng
+-- trong code app vẫn còn nguyên. Đăng nhập không cần đọc hash nữa: so mật khẩu
+-- nằm trong app.verify_staff_login() (05_crypto.sql), hàm chỉ trả đúng/sai.
+--
+-- Phải liệt kê cột, KHÔNG được viết `GRANT SELECT ON app.staff` rồi
+-- `REVOKE SELECT (password_hash)`: quyền mức bảng phủ mọi cột, REVOKE một cột
+-- khi đang có quyền mức bảng không có tác dụng gì. Thêm cột mới vào app.staff
+-- thì phải cân nhắc thêm vào danh sách này - mặc định là không đọc được.
+GRANT SELECT (id, branch_id, db_user, username, full_name, position, is_active, created_at)
+    ON app.staff TO app_user;
 
 -- INSERT vào cột BIGSERIAL cần USAGE trên sequence tương ứng.
 -- Cấp USAGE (nextval/currval) chứ không cấp ALL (tránh setval - đặt lại bộ đếm
@@ -71,7 +84,9 @@ GRANT SELECT, INSERT, UPDATE ON app.customers TO staff_role;
 GRANT SELECT, INSERT, UPDATE ON app.orders    TO staff_role;
 GRANT SELECT, INSERT, UPDATE ON app.payments  TO staff_role;
 GRANT SELECT ON app.branches TO staff_role;
-GRANT SELECT ON app.staff    TO staff_role;
+-- Cùng danh sách cột như app_user ở trên - không có password_hash.
+GRANT SELECT (id, branch_id, db_user, username, full_name, position, is_active, created_at)
+    ON app.staff TO staff_role;
 
 GRANT USAGE ON SEQUENCE app.customers_id_seq TO staff_role;
 GRANT USAGE ON SEQUENCE app.orders_id_seq    TO staff_role;

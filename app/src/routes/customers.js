@@ -43,14 +43,18 @@ router.get('/', async (req, res) => {
 //
 // Vi du khai thac (dan vao query string ?name=):
 //   ' UNION SELECT id, username, password_hash, db_user, branch_id FROM app.staff -- -
-//                             -> lo password_hash cua app.staff qua UNION-based SQLi
+//                             -> BI CHAN: "permission denied for table staff"
 //
-// Lop phong thu thuc su: RLS (postgres/init/06_rls.sql) han che du lieu doc
-// duoc du app co loi tang code hay khong - NHUNG chi trong pham vi cac bang
-// co bat RLS (customers/orders/payments). Bang app.staff KHONG bat RLS
-// (CLAUDE.md: "chỉ RLS trên customers/orders/payments") nen UNION-based SQLi
-// van doc duoc no - diem quan trong can neu trong bao cao: RLS khong thay
-// the parameterized query, chi la lop phong thu bo sung.
+// Lop phong thu thuc su nam o database, khong o day:
+//   - RLS (postgres/init/06_rls.sql) han che du lieu doc duoc du app co loi
+//     hay khong - NHUNG chi tren cac bang co bat RLS (customers/orders/
+//     payments). app.staff KHONG bat RLS.
+//   - Vi vay app.staff duoc bao ve bang quyen muc COT (04_grants.sql):
+//     app_user/staff_role khong doc duoc password_hash. Truoc khi co lop nay,
+//     payload tren lo hash cua ca ba chi nhanh.
+// Diem can neu trong bao cao: database chan duoc ca khi code sai, nhung RLS
+// khong thay the parameterized query - SQLi van doc duoc cac cot con lai
+// (username, db_user) cua app.staff.
 router.get('/search', async (req, res) => {
   const name = req.query.name || '';
   const sql = `SELECT id, full_name, email, phone, branch_id

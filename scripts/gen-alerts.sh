@@ -39,8 +39,11 @@ echo "==> Dien lai cac hanh vi bat thuong"
 echo "    nv_hcm01: giai ma CCCD hang loat               -> BULK_DECRYPT"
 as_nv nv_hcm01 'SELECT app.decrypt_text(cccd) FROM app.customers;'
 
-echo "    nv_dn01 : UNION SELECT doc password_hash        -> SQLI_UNION + STAFF_CREDENTIAL_READ"
+echo "    nv_dn01 : UNION SELECT doc password_hash (bi chan) -> SQLI_UNION + ACCESS_DENIED"
 as_nv nv_dn01 "SELECT full_name FROM app.customers WHERE full_name LIKE '%x%' UNION SELECT password_hash FROM app.staff;"
+
+echo "    nv_dn01 : UNION SELECT doc username nhan vien    -> SQLI_UNION + STAFF_CREDENTIAL_READ"
+as_nv nv_dn01 "SELECT full_name FROM app.customers WHERE full_name LIKE '%x%' UNION SELECT username FROM app.staff;"
 
 echo "    nv_hn01 : dieu kien luon dung OR 1=1            -> SQLI_TAUTOLOGY"
 as_nv nv_hn01 "SELECT id, full_name FROM app.customers WHERE full_name = '' OR 1=1;"

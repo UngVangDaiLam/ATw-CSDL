@@ -33,10 +33,10 @@ vào giả định "app luôn kiểm tra đúng".
 
 | Loại đe dọa | Ví dụ trong hệ thống | Kiểm soát tương ứng |
 | --- | --- | --- |
-| Spoofing | Giả mạo tài khoản nhân viên | `bcrypt` cho `app.staff.password_hash`, session xác thực trước khi `SET LOCAL ROLE` |
+| Spoofing | Giả mạo tài khoản nhân viên | `bcrypt` cho `app.staff.password_hash`, so mật khẩu trong DB (`app.verify_staff_login()`), session xác thực trước khi `SET LOCAL ROLE` |
 | Tampering | Sửa `id` trong URL để xem đơn hàng chi nhánh khác (IDOR) | Row-Level Security ở tầng DB (`branch_isolation` policy) — chặn được kể cả khi app quên kiểm tra quyền |
 | Repudiation | Nhân viên chối đã đọc/sửa dữ liệu | pgAudit ghi mọi câu lệnh + mọi lần `SET ROLE`, quy trách nhiệm theo `pid` phiên (xem CLAUDE.md mục "Log") |
-| Information Disclosure | SQL Injection dump `app.customers`/`app.staff` | Mã hóa cột `cccd`/`card_token` bằng `app.encrypt_text()` — dump được nhưng chỉ thấy bytea vô nghĩa; riêng `app.staff` không bật RLS nên vẫn là mục tiêu khả thi của UNION-based SQLi (xem `app/README.md`) |
+| Information Disclosure | SQL Injection dump `app.customers`/`app.staff` | Mã hóa cột `cccd`/`card_token` bằng `app.encrypt_text()` — dump được nhưng chỉ thấy bytea vô nghĩa; riêng `app.staff` không bật RLS nên được bảo vệ bằng quyền mức cột — không role nghiệp vụ nào đọc được `password_hash`, UNION-based SQLi bị từ chối (xem `app/README.md`) |
 | Denial of Service | Truy vấn nặng làm chậm hệ thống | `statement_timeout`/`idle_in_transaction_session_timeout` ở mức role (`postgres/init/02_roles.sh`); tấn công DoS diện rộng ngoài phạm vi đồ án |
 | Elevation of Privilege | App bị chiếm quyền, thử `DROP TABLE`/đổi quyền | `app_user` không sở hữu object nào, không có DDL, `NOINHERIT` (least privilege) |
 

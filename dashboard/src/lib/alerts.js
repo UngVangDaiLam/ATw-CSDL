@@ -24,6 +24,11 @@ export const RULES = {
     label: 'Đọc mật khẩu nhân viên',
     hint: 'Phiên nhân viên đọc app.staff — bảng chứa password_hash',
   },
+  ACCESS_DENIED: {
+    score: 85,
+    label: 'Bị từ chối quyền',
+    hint: 'PostgreSQL từ chối câu lệnh (vd. đọc password_hash) — lớp 1 đã chặn, cảnh báo là dấu vết lần thử (65, hoặc 85 nếu nhắm vào thông tin đăng nhập)',
+  },
   SQLI_SCHEMA_PROBE: {
     score: 70,
     label: 'Dò cấu trúc CSDL',

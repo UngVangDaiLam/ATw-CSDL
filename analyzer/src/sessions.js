@@ -98,6 +98,36 @@ class SessionTracker {
       return;
     }
 
+    // Cau lenh bi TU CHOI QUYEN (SQLSTATE 42501). pgAudit KHONG ghi dong AUDIT
+    // nao cho no: PostgreSQL kiem tra quyen truoc khi goi hook cua pgAudit, nen
+    // trong log chi co mot dong ERROR kem nguyen van cau lenh. Bo qua dong nay
+    // thi moi cuoc tan cong bi lop 1 chan deu VO HINH voi lop 3 - vi du SQLi
+    // UNION doc app.staff.password_hash (04_grants.sql chan o muc cot). Vai van
+    // lay tu phien nhu moi cau lenh khac, nen quy duoc cho dung nv_xxx.
+    if (record.error_severity === 'ERROR' && record.state_code === '42501') {
+      this.flushSession(session);
+      this.onStatement({
+        sessionId: session.sessionId,
+        pid: session.pid,
+        sessionUser: session.sessionUser,
+        database: session.database,
+        remoteHost: session.remoteHost,
+        appName: session.appName,
+        actor: session.role || session.sessionUser,
+        roleWasSet: Boolean(session.role),
+        timestamp: record.timestamp,
+        statementId: null,
+        class: 'DENIED',
+        command: record.ps || '',
+        statement: record.statement || '',
+        relations: [],
+        decryptedRows: 0,
+        encryptedRows: 0,
+        deniedMessage: record.message || '',
+      });
+      return;
+    }
+
     const audit = parseAuditMessage(message);
     if (!audit) return;
 

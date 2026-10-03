@@ -27,12 +27,12 @@ CREATE TABLE app.branches (
 -- db_user ánh xạ nhân viên -> role đăng nhập PostgreSQL. Policy RLS ở bước sau
 -- sẽ dùng current_user để tra ra branch_id, nên cột này phải có sẵn từ bây giờ.
 --
--- username/password_hash: đăng nhập ở tầng app/ (Express). app_user có SELECT
--- trên toàn bảng (04_grants.sql) nên tự tra được hàng này TRƯỚC khi biết phải
--- SET ROLE sang nv_xxx nào - đây là bước duy nhất app_user đọc password_hash,
--- và cũng chính vì staff KHÔNG bật RLS nên nó là mục tiêu của demo SQL
--- Injection trong app/ (xem app/README.md). password_hash là bcrypt, không
--- bao giờ là plaintext.
+-- username/password_hash: đăng nhập ở tầng app/ (Express) qua hàm
+-- app.verify_staff_login() (05_crypto.sql) - hàm so mật khẩu bên trong DB và
+-- trả về db_user để app biết phải SET ROLE sang nv_xxx nào. KHÔNG role nghiệp
+-- vụ nào đọc được cột password_hash (quyền mức cột, 04_grants.sql). Bảng này
+-- KHÔNG bật RLS, nên quyền mức cột là thứ chặn demo SQL Injection trong app/
+-- (xem app/README.md). password_hash là bcrypt, không bao giờ là plaintext.
 -- -----------------------------------------------------------------------------
 CREATE TABLE app.staff (
     id            SERIAL      PRIMARY KEY,

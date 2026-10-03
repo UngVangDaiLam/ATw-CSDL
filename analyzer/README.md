@@ -161,7 +161,8 @@ cùng `statement_id` — cũng phải gom lại, nếu không sẽ đếm trùng
 | `SQLI_UNION` | 90 | câu lệnh chứa `UNION ... SELECT` — dấu vết khai thác đọc sang bảng khác |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã ≥ `BULK_DECRYPT_THRESHOLD` bản ghi (điểm tăng theo khối lượng) |
 | `SQLI_TAUTOLOGY` | 85 | điều kiện luôn đúng kiểu `OR 1=1`, `OR 'a'='a'` |
-| `STAFF_CREDENTIAL_READ` | 75 | đọc `app.staff` (chứa `password_hash`) **từ phiên đã `SET ROLE`** |
+| `ACCESS_DENIED` | 65–85 | câu lệnh bị PostgreSQL **từ chối quyền** (SQLSTATE `42501`); 85 nếu nhắm vào `password_hash` / `app.staff` |
+| `STAFF_CREDENTIAL_READ` | 75 | đọc `app.staff` **từ phiên đã `SET ROLE`** |
 | `SQLI_SCHEMA_PROBE` | 70 | truy vấn `pg_catalog` / `information_schema` từ phiên ứng dụng |
 | `FULL_TABLE_READ` | 60 | `SELECT` trên bảng nhạy cảm mà không có `WHERE` |
 | `AFTER_HOURS` | 40 | chạm dữ liệu ngoài 7h–19h hoặc cuối tuần |
@@ -187,11 +188,31 @@ câu `UNION SELECT` đọc `app.staff` lúc 2 giờ sáng sinh ra ba cảnh báo
 Ba góc nhìn cùng chỉ vào một hành vi là bằng chứng mạnh hơn một cảnh báo tổng
 hợp mơ hồ.
 
+### `ACCESS_DENIED` — tấn công bị chặn vẫn phải nhìn thấy được
+
+Không role nghiệp vụ nào đọc được `app.staff.password_hash` (quyền mức cột,
+`postgres/init/04_grants.sql`), nên SQLi `UNION SELECT password_hash ...` bị
+PostgreSQL từ chối. Nhưng **pgAudit không ghi dòng AUDIT nào cho câu bị từ chối
+quyền**: PostgreSQL kiểm tra quyền trước khi gọi hook của pgAudit. Trong log chỉ
+còn một dòng `ERROR` có `state_code = 42501` kèm nguyên văn câu lệnh (đã kiểm
+chứng). Chỉ đọc dòng AUDIT thì mọi lần tấn công bị lớp 1 chặn đều vô hình với
+lớp 3.
+
+`sessions.js` vì vậy bắt riêng dòng `ERROR` + `42501` và phát ra một sự kiện
+câu lệnh `class = 'DENIED'`. Vai vẫn lấy từ phiên (`SET ROLE` trước đó), nên
+cảnh báo quy về đúng `nv_xxx`. `SQLI_*` cũng xét class này: khai thác thất bại
+vẫn là khai thác.
+
+Rule này cũng bắt cả các phép thử âm của `verify.sh` (`DROP TABLE`, `DELETE`…
+bằng `app_user`) — đúng, đó là những lần thử thật bị từ chối.
+
 ### Vì sao `STAFF_CREDENTIAL_READ` không báo động giả lúc đăng nhập
 
-`app_user` **buộc phải** có `SELECT` trên toàn bộ `app.staff` — chính luồng
-đăng nhập cần đọc `password_hash` để so sánh bcrypt. Không thể phân biệt truy
-cập hợp lệ với truy cập đáng ngờ bằng câu lệnh, nên rule phân biệt bằng **danh
+Đăng nhập không còn đọc `app.staff` trực tiếp: nó gọi
+`app.verify_staff_login($1, $2)` và việc đọc bảng nằm trong thân hàm
+(`substatement_id > 1`), không tính vào `relations`. Nhưng `app_user` vẫn có
+`SELECT` trên các cột không nhạy cảm của `app.staff`, và một lần đọc bảng nhân
+viên vẫn có thể hợp lệ hay đáng ngờ tùy ngữ cảnh. Rule phân biệt bằng **danh
 tính lúc chạy**:
 
 - Lúc đăng nhập, app chưa biết người dùng là ai nên **chưa** `SET ROLE` → bỏ qua.

@@ -128,15 +128,28 @@ curl -b cookies.txt \
   "http://127.0.0.1:3000/customers/search?name=x' UNION SELECT id, username, password_hash, db_user, branch_id FROM app.staff -- -"
 ```
 
-Khai thác thành công vì `app.staff` **không bật RLS** (chỉ `customers` /
-`orders` / `payments` mới `FORCE ROW LEVEL SECURITY`), và `app_user` vốn có
-`SELECT` trên toàn bộ bảng đó để phục vụ chính luồng đăng nhập
-(`postgres/init/04_grants.sql`). Kết quả: đọc được `password_hash` (bcrypt,
-không phải plaintext) của cả 3 chi nhánh, bất kể người tấn công đã `SET ROLE`
-sang chi nhánh nào.
+Kết quả: **`500 permission denied for table staff`**. Lỗ hổng trong code vẫn
+còn nguyên (câu `UNION` chạy tới database), nhưng PostgreSQL từ chối cả câu.
 
-Điểm cần nêu trong báo cáo: RLS không thay thế parameterized query — nó chỉ là
-lớp phòng thủ bổ sung, và chỉ áp dụng cho các bảng đã khai báo policy.
+`app.staff` **không bật RLS** (chỉ `customers` / `orders` / `payments` mới
+`FORCE ROW LEVEL SECURITY`), nên RLS không cứu được bảng này. Chốt chặn là
+**quyền mức cột** (`postgres/init/04_grants.sql`): `app_user` và `staff_role`
+chỉ được `SELECT` các cột khác `password_hash`. Đăng nhập không cần đọc hash:
+`routes/auth.js` gọi `app.verify_staff_login($1, $2)` (`05_crypto.sql`), hàm
+`SECURITY DEFINER` tự so bằng `crypt()` của pgcrypto và chỉ trả về nhân viên khi
+đúng mật khẩu. Hash không bao giờ rời khỏi database, kể cả tới chính app.
+
+**Trước/sau (cho báo cáo):** trước khi có quyền mức cột, payload trên đọc được
+`password_hash` (bcrypt) của cả 3 chi nhánh, bất kể người tấn công đã `SET ROLE`
+sang chi nhánh nào — bằng chứng rằng RLS chỉ bảo vệ các bảng có khai báo policy.
+
+Còn lại: SQLi vẫn đọc được các cột không nhạy cảm của `app.staff` (`username`,
+`db_user`). RLS và phân quyền không thay thế được parameterized query — chúng là
+các lớp bổ sung khi code sai.
+
+Lớp 3 vẫn thấy lần tấn công bị chặn: câu lệnh bị từ chối quyền không có dòng
+AUDIT, nhưng có dòng `ERROR` (SQLSTATE `42501`) trong log; analyzer đọc nó và
+sinh `ACCESS_DENIED` + `SQLI_UNION`, quy về đúng nhân viên.
 
 ### 2. IDOR — `GET /orders/:id`
 
@@ -215,9 +228,10 @@ Chỉ đếm lần **sai**; đăng nhập đúng xóa bộ đếm của cặp đ
 chối ngay cả khi mật khẩu đúng — nếu không, phản hồi khác nhau vẫn cho biết
 mật khẩu nào trúng. Username không phân biệt hoa thường.
 
-Username không tồn tại cũng chạy `bcrypt.compare` (với một hash giả cùng cost)
-để thời gian phản hồi không cho biết username nào có thật — đo được ~10 ms cho
-cả hai trường hợp.
+Username không tồn tại cũng chạy `crypt()` (với một salt giả cùng cost
+`$2a$06$`, bên trong `app.verify_staff_login()`) để thời gian phản hồi không
+cho biết username nào có thật — đo trong database được ~3–4 ms cho cả hai
+trường hợp.
 
 Bộ đếm nằm trong bộ nhớ tiến trình: `docker compose restart app` là xóa hết.
 Mỗi lần chạy `verify.sh` cộng 5 lần sai vào ngưỡng theo IP của máy host (với

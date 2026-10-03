@@ -14,10 +14,10 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | **Xong** (6 rule, ghi `audit.alerts` bằng `analyzer_user`) |
+| 3 | `pgAudit` + analyzer tự viết | **Xong** (8 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`) |
 | 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (89 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (97 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -302,12 +302,21 @@ này. Đọc `app/README.md` trước khi sửa — dưới đây chỉ là ph�
   role. An toàn vì `db_user` không phải input trực tiếp từ client — nó đến từ
   `app.staff.db_user` lúc login, lưu vào session phía server. Middleware vẫn
   whitelist bằng regex (`/^[a-z][a-z0-9_]*$/`) làm lớp phòng vệ cuối.
-- **`app.staff` có `username`/`password_hash` (bcrypt) nhưng KHÔNG bật RLS.**
-  Đây là mục tiêu thật của demo SQL Injection ở `/customers/search`: `app_user`
-  vốn đã có `SELECT` trên toàn bảng `app.staff` để phục vụ chính luồng đăng
-  nhập, nên UNION-based SQLi đọc được `password_hash` bất kể `SET ROLE` đang
-  là chi nhánh nào — RLS trên `customers`/`orders`/`payments` không cứu được
-  vì `staff` không nằm trong phạm vi của nó.
+- **`app.staff` KHÔNG bật RLS — `password_hash` được bảo vệ bằng quyền mức
+  cột.** `app_user` và `staff_role` chỉ có `SELECT` trên danh sách cột liệt kê
+  tường minh trong `04_grants.sql`, không có `password_hash`. Đăng nhập gọi
+  `app.verify_staff_login($1, $2)` (`05_crypto.sql`, SECURITY DEFINER, so bằng
+  `crypt()` của pgcrypto, chỉ trả về nhân viên khi đúng). Nhờ vậy SQLi UNION ở
+  `/customers/search` bị từ chối `permission denied for table staff`, dù lỗ
+  hổng code vẫn còn. Đừng:
+  - "rút gọn" thành `GRANT SELECT ON app.staff` + `REVOKE SELECT
+    (password_hash)` — quyền mức bảng phủ mọi cột, REVOKE một cột không có tác
+    dụng. Thêm cột mới vào `staff` thì cân nhắc thêm vào danh sách.
+  - cấp `EXECUTE` hàm đó cho `staff_role` — phiên đã `SET ROLE` không có lý do
+    kiểm tra mật khẩu, cấp vào là SQLi mượn được hàm làm máy dò mật khẩu.
+  - truyền mật khẩu bằng cách nối chuỗi — phải là tham số, nếu không nó vào log
+    pgAudit nguyên văn.
+  - quay lại `bcryptjs` ở tầng app — app đọc được hash là SQLi đọc được hash.
 - **2 lỗ hổng cố ý — đừng "sửa cho sạch".** `/customers/search` (SQL
   Injection, nối chuỗi trực tiếp) và `/orders/:id` (IDOR, không kiểm tra
   branch_id) tồn tại có chủ đích để chứng minh RLS vẫn chặn được rò rỉ dù code
@@ -424,6 +433,11 @@ không ghi, các script gọi analyzer phải hiểu mã này. `verify.sh` dùng
 **pgAudit ghi `RESET ROLE` là `MISC,RESET`, không phải `MISC,SET`.** Xét đổi vai
 phải nhận cả hai command — xem mục `app/` về `RESET ROLE`.
 
+**Câu lệnh bị từ chối quyền KHÔNG có dòng AUDIT.** PostgreSQL kiểm tra quyền
+trước hook của pgAudit, nên log chỉ có dòng `ERROR` với `state_code = 42501`.
+`sessions.js` bắt riêng dòng này (class `DENIED`, rule `ACCESS_DENIED`). Đừng bỏ
+— thiếu nó thì SQLi đọc `password_hash` (giờ bị chặn) biến mất khỏi lớp 3.
+
 **Thiếu `secrets/` thì init sẽ fail.** Lần chạy đầu trên một máy mới phải
 `bash scripts/init-secrets.sh` trước (`scripts/reset.sh` đã tự gọi). Hàm đọc
 khóa cố ý `RAISE EXCEPTION` kèm HINT thay vì im lặng dùng khóa mặc định.
@@ -506,7 +520,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 89 phép thử, phải đạt hết
+bash scripts/verify.sh         # 97 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

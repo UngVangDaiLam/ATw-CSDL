@@ -160,11 +160,17 @@ LEAK=$(printf '%s' "$ATTACK" | node -e 'let s="";process.stdin.on("data",d=>s+=d
 LEAK_N="${LEAK%%|*}"; LEAK_S="${LEAK#*|}"
 if [ "${LEAK_N:-0}" -gt 0 ] 2>/dev/null; then
     warn "THUNG: SQLi doc duoc $LEAK_N dong tu app.staff (vi du: $LEAK_S)"
-    info "Vi sao thung: app.staff KHONG bat RLS (chi customers/orders/payments co),"
-    info "ma app_user von co SELECT tren app.staff de phuc vu dang nhap."
-    good "Nhung: password_hash la bcrypt, KHONG phai plaintext -> khong dung lai ngay duoc."
-    info "=> Bai hoc: RLS khong thay the parameterized query. No chi la lop bo sung,"
-    info "   va chi bao ve cac bang co khai bao policy."
+    info "app_user van con quyen doc cot password_hash - kiem tra 04_grants.sql"
+    info "(DB dang chay ban init cu? -> bash scripts/reset.sh)."
+elif printf '%s' "$ATTACK" | grep -q 'permission denied'; then
+    good "BI CHAN: $(printf '%s' "$ATTACK" | jget message)"
+    info "Lo hong SQLi trong code app VAN CON NGUYEN - cau UNION da chay toi DB."
+    info "Nhung app_user/staff_role chi duoc doc cac cot KHAC password_hash"
+    info "(quyen muc COT, 04_grants.sql), nen PostgreSQL tu choi ca cau lenh."
+    info "Dang nhap van chay: so mat khau nam trong app.verify_staff_login() (crypt"
+    info "cua pgcrypto), app khong bao gio cam hash."
+    info "=> Truoc day buoc nay THUNG: app.staff khong bat RLS, RLS khong bao ve"
+    info "   duoc bang khong co policy. Chot chan la phan quyen muc cot, khong phai RLS."
 else
     info "Ket qua: $ATTACK"
 fi
@@ -246,7 +252,9 @@ dash_sql -c "SELECT id, db_user, rule_triggered, risk_score,
              FROM audit.alerts
              WHERE id > ${MAX0:-0} AND rule_triggered <> 'AFTER_HOURS'
              ORDER BY risk_score DESC, id LIMIT 8;"
-good "SQLi -> SQLI_UNION + STAFF_CREDENTIAL_READ, quy ve dung nv_hn01 (nho SET ROLE)."
+good "SQLi -> SQLI_UNION + ACCESS_DENIED, quy ve dung nv_hn01 (nho SET ROLE)."
+info "Cau UNION bi chan van de lai dong ERROR 42501 trong log - analyzer doc no"
+info "nen lan tan cong that bai van bi goi ten, khong vo hinh voi lop 3."
 info "Luu y trung thuc: analyzer KHONG bat duoc IDOR o buoc 4 - no chi doc duoc"
 info "cau lenh trong log, ma IDOR la truy van hop le ve mat cu phap (xem"
 info "analyzer/README.md muc gioi han). Chinh RLS moi la thu chan IDOR."

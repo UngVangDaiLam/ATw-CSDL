@@ -1,5 +1,4 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
 const pool = require('../db');
 const { issueCsrfToken } = require('../csrf');
 const limiter = require('../loginLimiter');
@@ -8,17 +7,21 @@ const { serverError } = require('../errors');
 
 const router = express.Router();
 
-// Hash gia, cung cost voi hash trong 07_seed.sql ($2a$06$). Username khong ton
-// tai van chay bcrypt.compare voi no, de thoi gian phan hoi khong cho biet
-// username nao co that.
-const DUMMY_HASH = bcrypt.hashSync('khong-phai-mat-khau-that', 6);
-
 // POST /auth/login - xac thuc bang username/password (parameterized query -
 // KHONG noi chuoi truc tiep, khac voi GET /customers/search o duoi).
 //
 // Dung pool.query() thang (khong SET ROLE) vi luc nay CHUA biet dang nhap
-// thanh cong hay chua, va app_user von da co SELECT tren toan bo app.staff
-// (postgres/init/04_grants.sql) - du de tra username/password_hash/db_user.
+// thanh cong hay chua.
+//
+// App KHONG doc password_hash - app_user khong co quyen tren cot do
+// (postgres/init/04_grants.sql). So mat khau nam trong database:
+// app.verify_staff_login() (05_crypto.sql) dung crypt() cua pgcrypto, dung
+// mat khau thi tra 1 dong thong tin nhan vien, sai thi 0 dong. Ham do tu chay
+// bcrypt voi salt gia khi username khong ton tai, nen thoi gian phan hoi khong
+// lo username nao co that.
+//
+// Mat khau PHAI di qua tham so $2: noi chuoi vao cau SQL la mat khau nam
+// nguyen van trong log pgAudit.
 router.post('/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
@@ -35,15 +38,13 @@ router.post('/login', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, username, password_hash, db_user, branch_id, full_name
-       FROM app.staff
-       WHERE username = $1 AND is_active`,
-      [username]
+      `SELECT id, username, db_user, branch_id, full_name
+       FROM app.verify_staff_login($1, $2)`,
+      [String(username), String(password)]
     );
 
     const staff = result.rows[0];
-    const ok = await bcrypt.compare(String(password), staff?.password_hash || DUMMY_HASH);
-    if (!staff || !staff.password_hash || !ok) {
+    if (!staff) {
       const lock = limiter.recordFailure(req.ip, username);
       // Vua bi khoa: ghi MOT su kien cho lop 3 (src/securityLog.js). Khong ghi
       // mat khau; username la du lieu nguoi dung go vao - cat ngan.

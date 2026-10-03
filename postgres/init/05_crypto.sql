@@ -110,6 +110,7 @@ GRANT USAGE ON SCHEMA ext TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.pgp_sym_encrypt(text, text, text) TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.pgp_sym_decrypt(bytea, text)      TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.hmac(text, text, text)            TO db_owner;
+GRANT EXECUTE ON FUNCTION ext.crypt(text, text)                 TO db_owner;   -- PHẦN 4
 
 SET ROLE db_owner;
 
@@ -204,6 +205,69 @@ REVOKE ALL ON FUNCTION app.blind_index(text)  FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app.encrypt_text(text)  TO app_user, staff_role;
 GRANT EXECUTE ON FUNCTION app.decrypt_text(bytea) TO app_user, staff_role;
 GRANT EXECUTE ON FUNCTION app.blind_index(text)   TO app_user, staff_role;
+
+-- =============================================================================
+-- PHẦN 4 - Xác thực nhân viên mà không để lộ password_hash
+--
+-- app_user KHÔNG đọc được cột app.staff.password_hash (04_grants.sql). Việc so
+-- mật khẩu dời vào database: hàm nhận username + mật khẩu, tự so bằng crypt()
+-- của pgcrypto (kiểm tra được bcrypt '$2a$', đúng loại hash 07_seed.sql tạo),
+-- và chỉ trả về thông tin nhân viên khi đúng. Sai thì 0 dòng. Hash không bao
+-- giờ rời khỏi database, kể cả tới chính ứng dụng.
+--
+-- Ba điểm phải giữ:
+--
+-- 1. Mật khẩu phải đi vào hàm dưới dạng THAM SỐ ($1, $2) - app/routes/auth.js
+--    làm đúng như vậy. Viết thẳng mật khẩu vào câu SQL là nó nằm nguyên văn
+--    trong log pgAudit (log_parameter = off chỉ che được tham số).
+--
+-- 2. Username không tồn tại vẫn chạy crypt() với một salt giả CÙNG cost
+--    ($2a$06$, cost mặc định của gen_salt('bf')). Bỏ đi thì username có thật
+--    trả lời chậm hơn hẳn (bcrypt) - đo thời gian phản hồi là dò ra được danh
+--    sách tài khoản.
+--
+-- 3. CHỈ app_user được gọi, staff_role thì KHÔNG. Lượt đăng nhập chạy trước khi
+--    SET ROLE; sau khi đã SET ROLE sang nv_xxx thì không còn lý do gì để kiểm
+--    tra mật khẩu nữa. Nhờ vậy SQL Injection chạy dưới vai nhân viên cũng không
+--    mượn được hàm này làm "máy dò mật khẩu".
+--
+-- Hạn chế còn lại (ghi vào báo cáo): ai cầm được mật khẩu của chính app_user
+-- vẫn gọi được hàm này để thử mật khẩu, vòng qua bộ đếm đăng nhập sai của tầng
+-- web (app/src/loginLimiter.js). Vẫn tốt hơn hẳn trước đây - khi đó họ lấy được
+-- cả hash để dò ngoại tuyến không giới hạn tốc độ; giờ mỗi lần thử phải đi qua
+-- server và trả giá một lần bcrypt.
+-- =============================================================================
+SET ROLE db_owner;
+
+CREATE FUNCTION app.verify_staff_login(p_username text, p_password text)
+    RETURNS TABLE (id int, username text, db_user text, branch_id int, full_name text)
+    LANGUAGE plpgsql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = ext, pg_catalog
+AS $$
+DECLARE
+    v_staff app.staff%ROWTYPE;
+    -- Salt bcrypt hợp lệ (22 ký tự), không ứng với mật khẩu nào - xem điểm 2.
+    c_dummy CONSTANT text := '$2a$06$KhongPhaiMatKhauThat00';
+BEGIN
+    SELECT s.* INTO v_staff
+    FROM   app.staff s
+    WHERE  s.username = p_username AND s.is_active;
+
+    -- Không tìm thấy (hoặc nhân viên chưa có mật khẩu) thì password_hash là
+    -- NULL: phép so ra NULL, không bao giờ là true.
+    IF ext.crypt(coalesce(p_password, ''), coalesce(v_staff.password_hash, c_dummy))
+           = v_staff.password_hash THEN
+        RETURN QUERY SELECT v_staff.id, v_staff.username, v_staff.db_user,
+                            v_staff.branch_id, v_staff.full_name;
+    END IF;
+END $$;
+
+RESET ROLE;
+
+REVOKE ALL ON FUNCTION app.verify_staff_login(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.verify_staff_login(text, text) TO app_user;
 
 -- =============================================================================
 -- GHI CHÚ CHO BƯỚC SAU

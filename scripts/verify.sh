@@ -120,11 +120,39 @@ if [ -s secrets/pgcrypto_key ] && grep -rqF "$(cat secrets/pgcrypto_key)" logs/ 
 else ok "khoa KHONG xuat hien trong log"; fi
 
 # -----------------------------------------------------------------------------
-section "APP - lien ket dang nhap (app.staff.username/password_hash)"
-expect "app_user tra cuu duoc staff de dang nhap (SELECT bang app.staff)" "hn01" \
+section "LOP 1e - app.staff: khong role nghiep vu nao doc duoc password_hash"
+# app.staff KHONG bat RLS - chot chan la quyen muc COT (04_grants.sql). Day la
+# thu bien SQLi UNION o /customers/search tu "lo hash" thanh "bi tu choi".
+expect "app_user van doc duoc cac cot khac cua app.staff" "hn01" \
        "$(sql_app "SELECT username FROM app.staff WHERE username = 'hn01';")"
-expect "password_hash la bcrypt, khong phai plaintext" '$2' \
-       "$(sql_app "SELECT password_hash FROM app.staff WHERE username = 'hn01';")"
+expect "app_user KHONG doc duoc cot password_hash" "permission denied for table staff" \
+       "$(sql_app "SELECT password_hash FROM app.staff;")"
+expect "nhan vien (staff_role) KHONG doc duoc password_hash" "permission denied for table staff" \
+       "$(sql_nv nv_hn01 "SELECT password_hash FROM app.staff;")"
+expect "SQLi kieu UNION doc password_hash bi PostgreSQL tu choi" "permission denied for table staff" \
+       "$(sql_nv nv_hn01 "SELECT full_name FROM app.customers WHERE full_name LIKE '%x%' UNION SELECT password_hash FROM app.staff;")"
+expect "password_hash la bcrypt, khong phai plaintext (doc bang superuser)" '$2' \
+       "$(sql_su "SELECT password_hash FROM app.staff WHERE username = 'hn01';")"
+
+# Dang nhap qua app.verify_staff_login(). Mat khau gui bang \bind (tham so cua
+# giao thuc extended query) - dung nhu app lam. Viet thang vao chuoi SQL thi
+# chinh phep thu se ghi mat khau vao log.
+login_fn() {
+    printf 'SELECT db_user FROM app.verify_staff_login($1, $2) \\bind %s %s \\g\n' "$1" "$2" \
+        | docker compose exec -T postgres psql "$APP_URL" -tA 2>&1
+}
+expect "dang nhap dung mat khau qua app.verify_staff_login" "nv_hn01" \
+       "$(login_fn hn01 'Demo@123456')"
+WRONG_PW="sai_mk_$(date +%s)_$RANDOM"
+LOGIN_WRONG="$(login_fn hn01 "$WRONG_PW")"
+if [ -z "$LOGIN_WRONG" ]; then ok "sai mat khau -> ham tra 0 dong"
+else bad "sai mat khau -> ham tra 0 dong" "rong" "$LOGIN_WRONG"; fi
+expect "nhan vien (sau SET ROLE) KHONG goi duoc ham kiem tra mat khau" "permission denied for function verify_staff_login" \
+       "$(sql_nv nv_hn01 "SELECT * FROM app.verify_staff_login('hn01', 'x');")"
+sleep 2
+if grep -rqF "$WRONG_PW" logs/ 2>/dev/null; then
+    bad "mat khau gui qua tham so KHONG xuat hien trong log" "khong co" "tim thay $WRONG_PW trong logs/"
+else ok "mat khau gui qua tham so KHONG xuat hien trong log"; fi
 
 # -----------------------------------------------------------------------------
 section "LOP 3 - Giam sat bang pgAudit"
@@ -212,7 +240,11 @@ else
     # luu vi tri vuot qua cac dong ben duoi truoc khi dry-run kip doc.
     SINCE="$(sql_su "SELECT to_char(now() AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD HH24:MI:SS.MS');")"
     sql_nv nv_hcm01 'SELECT count(app.decrypt_text(cccd)) FROM app.customers;' >/dev/null
+    # Cau nay bi TU CHOI (password_hash): pgAudit khong ghi AUDIT, analyzer phai
+    # doc dong ERROR 42501 moi thay (ACCESS_DENIED, xem sessions.js).
     sql_nv nv_hcm01 "SELECT full_name FROM app.customers WHERE cccd_hash = app.blind_index('079203000005') UNION SELECT password_hash FROM app.staff;" >/dev/null
+    # Cau nay CHAY DUOC (cot username) -> STAFF_CREDENTIAL_READ.
+    sql_nv nv_hcm01 "SELECT full_name FROM app.customers WHERE id = 0 UNION SELECT username FROM app.staff;" >/dev/null
 
     # Mo phong dung trinh tu cua app/ tren MOT ket noi duoc pool tai su dung:
     # request cua nv_dn01 (SET LOCAL ROLE trong transaction), roi tren CUNG ket
@@ -238,6 +270,9 @@ else
     expect "analyzer phat hien giai ma hang loat" "BULK_DECRYPT" "$ANALYZER_OUT"
     expect "analyzer phat hien dau vet UNION SELECT" "SQLI_UNION" "$ANALYZER_OUT"
     expect "analyzer phat hien truy cap bang chua password_hash" "STAFF_CREDENTIAL_READ" "$ANALYZER_OUT"
+    # Tan cong bi lop 1 chan van phai hien o lop 3, va van quy dung nguoi.
+    expect "analyzer bat lan SQLi bi tu choi quyen, quy cho nv_hcm01 (ACCESS_DENIED)" "nv_hcm01" \
+           "$(printf '%s' "$ANALYZER_OUT" | grep 'ACCESS_DENIED')"
     # Diem mau chot cua ca lop 3: log tho chi ghi "app_user", canh bao phai goi
     # duoc ten nhan vien that nho bam theo SET ROLE trong tung phien.
     expect "canh bao quy trach nhiem cho nv_hcm01 (khong phai app_user)" "nv_hcm01" "$ANALYZER_OUT"

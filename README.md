@@ -74,7 +74,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
-│       └── rules/          # 9 rule trên log pgAudit + 2 rule tầng web
+│       └── rules/          # 9 rule trên log PostgreSQL (2 rule tầng web ở src/appEvents.js)
 └── dashboard/              # React + Socket.IO, đọc audit.alerts bằng dashboard_user - xem dashboard/README.md
 ```
 
@@ -201,8 +201,8 @@ chỉ với các role nghiệp vụ.
 |------|-----------|-------|
 | `postgres` | chỉ socket nội bộ | superuser; bỏ qua RLS |
 | `db_owner` | có | sở hữu schema `app`, `audit` và toàn bộ bảng. Bị `FORCE RLS` chặn nên **đọc ra 0 dòng** dữ liệu |
-| `app_user` | có | `SELECT, INSERT, UPDATE` trên `customers`, `orders`, `payments`. **Không** DELETE, **không** DDL, **không** chạm `audit`. Chưa `SET ROLE` thì **đọc ra 0 dòng** |
-| `staff_role` | không | role nhóm, giữ quyền trên bảng cho nhân viên |
+| `app_user` | có | `SELECT, INSERT, UPDATE` trên `customers`, `orders`, `payments`. `SELECT` trên `app.staff` **trừ cột `password_hash`** (quyền mức cột); đăng nhập qua `app.verify_staff_login()`. **Không** DELETE, **không** DDL, **không** chạm `audit`. Chưa `SET ROLE` thì **đọc ra 0 dòng** |
+| `staff_role` | không | role nhóm, giữ quyền trên bảng cho nhân viên. Cũng không đọc được `password_hash`, không gọi được hàm kiểm tra mật khẩu |
 | `nv_hn01` `nv_dn01` `nv_hcm01` | **không** (`NOLOGIN`) | nhân viên từng chi nhánh. Chỉ vào được bằng `SET ROLE` từ `app_user` |
 | `readonly_user` | có | `SELECT` trên `customers`, `orders` của chi nhánh mình. Bị ép `default_transaction_read_only = on` |
 | `admin_user` | có | không có quyền trực tiếp trên bảng; `SET ROLE db_owner` để làm DDL |
@@ -344,8 +344,13 @@ từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` khô
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
 role nghiệp vụ không chạm được khóa, `readonly_user` không đọc được cột `cccd`,
+**không role nghiệp vụ nào đọc được `password_hash`** (SQLi UNION bị từ chối,
+đăng nhập vẫn chạy qua hàm, mật khẩu không rò vào log),
 **`pg_dump` không chứa CCCD hay số thẻ ở dạng rõ**, khóa không rò vào log,
-pgAudit ghi được câu lệnh và cả `SET ROLE`, `analyzer_user` ghi được cảnh báo
+pgAudit ghi được câu lệnh và cả `SET ROLE`, analyzer bắt được giải mã hàng
+loạt, SQLi (kể cả lần bị chặn), leo thang đặc quyền (tắt RLS, `GRANT ... TO
+PUBLIC`, hàm `SECURITY DEFINER`, thử `SUPERUSER`) và quy đúng người,
+`analyzer_user` ghi được cảnh báo
 nhưng không đọc/sửa/xóa được, `dashboard_user` đọc được cảnh báo nhưng không
 ghi được kể cả khi tự mở transaction READ WRITE, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
 ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`,
@@ -353,7 +358,7 @@ replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, 
 PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
 đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 62    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 103    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -571,7 +576,43 @@ rồi đọc cảnh báo bằng `dashboard_user`. Mở `dashboard/` song song đ
 báo hiện realtime. Giới hạn trung thực: analyzer **không** bắt được IDOR (truy
 vấn hợp lệ về cú pháp) — chính RLS mới chặn nó.
 
-## 8. Bước tiếp theo
+## 8. Hạn chế và hướng phát triển
 
-- Tài liệu báo cáo: kiến trúc, lý do thiết kế từng lớp, ánh xạ mối đe dọa →
-  lớp chặn → phép thử `verify.sh`, sơ đồ 4 lớp, slide.
+Những điểm dưới đây là giới hạn **đã biết và có chủ đích** của lab, không phải
+lỗi bị bỏ sót.
+
+**Chưa làm — hướng phát triển:**
+
+- **Mã hóa đường truyền (TLS).** Mã hóa ở lớp 2 bảo vệ dữ liệu khi lưu trữ;
+  sau khi `app.decrypt_text()` giải mã, CCCD đi dạng rõ từ database về app. Lab
+  chạy app và database trên cùng một máy, trong mạng Docker nội bộ, nên rủi ro
+  nghe lén thấp. Khi tách ra hai máy cần `ssl = on`, `hostssl` trong
+  `pg_hba.conf` và client dùng `sslmode=verify-full` — `require` có mã hóa
+  nhưng không xác thực server, vẫn bị tấn công xen giữa.
+- **Xoay khóa mã hóa.** `pgp_sym_encrypt` gắn chặt với khóa; đổi khóa phải
+  giải mã rồi mã hóa lại toàn bộ trong một transaction, giữ khóa cũ trong lúc
+  chuyển tiếp (thêm cột `key_version`). Hiện đổi khóa đồng nghĩa với
+  `scripts/reset.sh`.
+- **Mã hóa bản sao lưu.** Cột `cccd`/`card_token` trong backup đã là
+  ciphertext, nhưng họ tên, số điện thoại, đơn hàng trong `backup/full/` thì
+  chưa.
+
+**Giới hạn của lớp giám sát (chi tiết ở [`analyzer/README.md`](analyzer/README.md)):**
+
+- Không bắt được IDOR — câu lệnh hợp lệ về cú pháp, chỉ khác giá trị `id`.
+  RLS mới là thứ chặn nó.
+- pgAudit ghi câu lệnh, không ghi số dòng trả về; `FULL_TABLE_READ` đoán theo
+  hình dạng câu lệnh. Riêng `BULK_DECRYPT` đếm được số bản ghi thật.
+- pgAudit không ghi `COMMIT`/`ROLLBACK`: phải `RESET ROLE` sau mỗi transaction
+  (app đã làm) thì việc quy trách nhiệm mới đúng.
+- Phiên superuser qua unix socket trong container bị bỏ qua — ai có shell
+  trong container database đã ra ngoài mô hình.
+
+**Rủi ro còn lại ở tầng ứng dụng:**
+
+- SQLi ở `/customers/search` vẫn đọc được các cột không nhạy cảm của
+  `app.staff` (`username`, `db_user`). Phân quyền và RLS không thay thế được
+  parameterized query.
+- Ai cầm mật khẩu của chính `app_user` gọi được `app.verify_staff_login()` để
+  thử mật khẩu, vòng qua bộ đếm đăng nhập sai của tầng web — nhưng không lấy
+  được hash để dò ngoại tuyến, và mỗi lần thử tốn một lần bcrypt.

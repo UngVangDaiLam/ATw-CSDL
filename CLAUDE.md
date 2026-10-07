@@ -14,10 +14,10 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | **Xong** (9 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`) |
+| 3 | `pgAudit` + analyzer tự viết | **Xong** (11 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`; bản ghi mồi `HONEYTOKEN_ACCESS`) |
 | 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (103 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (129 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -168,12 +168,17 @@ tạo dưới quyền `postgres`, bảng sẽ thuộc superuser và mô hình t�
 bị phá. `app_user` không thể `DROP`/`ALTER` chính vì nó không phải owner — chỉ
 `REVOKE` thôi là không đủ.
 
-**`07_seed.sql` chia hai phần, đừng trộn vào nhau.** PHẦN A là vài dòng viết
+**`07_seed.sql` chia ba phần, đừng trộn vào nhau.** PHẦN A là vài dòng viết
 tay với giá trị cố định — `scripts/verify.sh` ghim cứng chúng (CCCD
 `001201000001`, tên `Khach Hang 02`, thẻ `4242424242424242`) nên sửa PHẦN A là
 phải sửa `verify.sh` theo. PHẦN B sinh hàng loạt bằng `generate_series`, khối
 lượng đặt ở ba biến `\set` đầu file (mặc định 6000 khách / 10000 đơn / 4000
-thanh toán — đề bài yêu cầu 5.000–10.000).
+thanh toán — đề bài yêu cầu 5.000–10.000). PHẦN C chèn **sau cùng** 6 khách
+hàng mồi (`n_honeytokens`, CCCD có chữ số thứ 5 là `8`, mỗi người một đơn) và
+đăng ký SHA-256 ciphertext của họ vào `audit.honeytokens`; `verify.sh` ghim
+`kh6001@example.local` (mồi chi nhánh 2, CCCD `048280006001`). Đặt PHẦN C
+lên trước PHẦN B là xê dịch id/phân bổ đơn của PHẦN B và số đo hiệu năng hết
+so sánh được.
 
 Sinh dữ liệu **trong database**, không bằng Faker.js ở tầng ứng dụng: `cccd`
 phải đi qua `app.encrypt_text()` + `app.blind_index()`, mà hai hàm đó lấy khóa
@@ -221,6 +226,21 @@ app.blind_index(text)   -> bytea
   bị `FORCE ROW LEVEL SECURITY` chặn nên đọc ra 0 dòng và hàm **luôn trả NULL**.
   Hàm chỉ nhận ciphertext và trả plaintext; câu `SELECT` nằm ở phía người gọi
   để RLS áp đúng chi nhánh của họ.
+- **Bản ghi mồi (honeytoken).** `app.decrypt_text()` gọi `audit.is_honeytoken()`
+  (tra `audit.honeytokens`); trúng thì kết quả đi qua `audit.honeytoken_tripped()`
+  — thân hàm đó là dấu mốc `honeytoken_tripwire` analyzer tìm trong dòng **lồng
+  nhau** (rule `HONEYTOKEN_ACCESS`). `audit.honeytokens` **không GRANT cho ai**,
+  kể cả `analyzer_user`/`dashboard_user` — đọc được danh sách là tránh được mồi.
+- **BẪY pgAudit — câu lồng nhau CÓ CHẠM BẢNG trong hàm `SECURITY DEFINER` bị
+  giấu** khi session user không là thành viên của chủ hàm (cố ý, của pgAudit).
+  Phiên `app_user` vì vậy không bao giờ thấy thân `app.branch_of()` hay phần
+  tra mồi; phiên `psql -U postgres` thì thấy — thử bằng superuser là tưởng
+  chạy đúng. Hệ quả: thân `app.decrypt_text()` và `audit.honeytoken_tripped()`
+  **không được chạm bảng nào**; viết `EXISTS (SELECT ... FROM audit.honeytokens)`
+  thẳng vào `decrypt_text` là mất dòng log giải mã, `BULK_DECRYPT` và
+  `HONEYTOKEN_ACCESS` cùng mù (đã xảy ra). Hai hàm phụ có mệnh đề `SET` để
+  không bị inline — đừng gỡ. Và đừng chuyển `decrypt_text` sang plpgsql: biểu
+  thức đơn giản của plpgsql không qua executor nên pgAudit không ghi.
 - `pgp_sym_encrypt()` **không tất định** — không `WHERE cccd = ...`, không
   index, không UNIQUE. Tra cứu qua `customers.cccd_hash` = `app.blind_index()`
   (HMAC-SHA256 + pepper, có chuẩn hóa bỏ ký tự không phải chữ/số).
@@ -243,6 +263,35 @@ app.blind_index(text)   -> bytea
   rồi `SET LOCAL ROLE nv_xxx` trong transaction cho từng request. Các role
   `nv_hn01` / `nv_dn01` / `nv_hcm01` đều `NOLOGIN` — không có mật khẩu, không
   kết nối trực tiếp được, chỉ vào được qua `SET ROLE`.
+- **`SET ROLE` thôi KHÔNG đủ — phải kèm token phiên.** `app_user` là thành viên
+  mọi `nv_*` nên `SET ROLE` luôn được; `app.branch_of(user, token)` chỉ trả chi
+  nhánh khi GUC `secdb.staff_token` là token còn hạn của **đúng** role đó
+  (`app.staff_sessions`, chỉ lưu SHA-256, không GRANT cho ai). Token cấp ở
+  `app.verify_staff_login()`, thu hồi ở `app.end_staff_session()`. Sai/thiếu thì
+  trả NULL (0 dòng) + `RAISE LOG 'SECDB_IDENTITY_WITHOUT_SESSION ...'` → rule
+  `IDENTITY_WITHOUT_SESSION`, quy cho **session user**, không cho vai bị mạo
+  danh. Analyzer chỉ tin dòng có `context` bắt đầu `PL/pgSQL function
+  current_branch_id() ` và `role` trùng vai đang mang.
+  - **`RAISE LOG` CHỈ được nằm ở `app.current_branch_id()`** (SECURITY INVOKER,
+    tự lấy `current_user`). Đừng dời về `app.branch_of(role, token)`: hàm đó
+    ai cũng gọi được với tên role tùy ý → giả cảnh báo nêu tên người vô tội,
+    hoặc đẩy trách nhiệm của chính mình sang `app_user` (đã xảy ra, có phép thử).
+  - **Không trả lại quyền `TEMP` cho PUBLIC** (`04_grants.sql`): hàm
+    `pg_temp.current_branch_id()` tự viết sẽ mang đúng context đó.
+  - **`log_parameter_max_length = 0` trong `postgresql.conf` là bắt buộc**:
+    `log_min_duration_statement` ghi câu chậm KÈM giá trị tham số — mật khẩu,
+    token, CCCD. `pgaudit.log_parameter = off` không che được đường này.
+  - App bắt đăng nhập lại khi phiên web quá ~12 giờ (`req.session.loginAt` ở
+    `setRole.js`), vì cookie tự gia hạn còn token thì không.
+  - Token **luôn đi bằng tham số** (`set_config(..., $1, true)`) hoặc
+    `PGOPTIONS` — không bao giờ trong câu SQL, không `SET LOCAL secdb.staff_token
+    = '...'` (misc_set ghi vào log). `verify.sh` grep log tìm token.
+  - Script thử nghiệm không có mật khẩu nhân viên: `. scripts/staff-token.sh`
+    rồi `mint_staff_token BIEN nv_xxx` (superuser chèn hash) +
+    `PGOPTIONS="-c secdb.staff_token=$BIEN"`. Gọi kiểu `X=$(mint...)` là sai —
+    subshell làm mất danh sách thu hồi. `verify.sh`, `gen-alerts.sh`,
+    `benchmark.sh` đều dùng nó; script mới `SET ROLE nv_*` mà quên token sẽ
+    thấy 0 dòng và tưởng RLS hỏng.
 - Dùng **`SET LOCAL ROLE` trong transaction**, không dùng `SET ROLE` trần. Với
   connection pool, quên `RESET ROLE` là request sau mượn lại connection đó sẽ
   chạy dưới danh tính người trước — lỗ hổng nặng và chỉ xuất hiện khi pool tái
@@ -254,7 +303,7 @@ app.blind_index(text)   -> bytea
   Cũng là chủ đích (phân tách nhiệm vụ). Cần thao tác dữ liệu ở mức quản trị
   thì dùng superuser qua socket — superuser bỏ qua RLS.
 - **BẪY `SECURITY DEFINER`:** bên trong hàm `SECURITY DEFINER`, `current_user`
-  trả về **chủ sở hữu hàm**, không phải người gọi. Vì vậy `app.branch_of(text)`
+  trả về **chủ sở hữu hàm**, không phải người gọi. Vì vậy `app.branch_of(text, text)`
   nhận user qua **tham số**, còn `app.current_branch_id()` là `SECURITY INVOKER`
   để lấy đúng `current_user` rồi truyền sang. Gộp làm một hàm `SECURITY DEFINER`
   là mọi role đều đọc ra 0 dòng — triệu chứng nhìn hệt như "RLS chặn đúng".
@@ -291,6 +340,10 @@ này. Đọc `app/README.md` trước khi sửa — dưới đây chỉ là ph�
   đăng nhập ở `routes/auth.js`), rồi `COMMIT`/`ROLLBACK` theo status code khi
   response kết thúc. **Đừng** quay lại kiểu `set_config('app.branch_id', ...)`
   của bản gốc — RLS ở `06_rls.sql` không đọc GUC đó, nó đọc `current_user`.
+  GUC `secdb.staff_token` mà `setRole.js` đặt là **bằng chứng** (token phiên),
+  không phải danh tính: tự đặt nó cũng không đổi được chi nhánh, vì token phải
+  khớp role đang `SET ROLE`. Token nằm ở `req.session.dbToken`, đừng chuyển vào
+  `req.session.staff` (trả về client ở `/auth/me`).
 - **Đừng bỏ `RESET ROLE` sau `COMMIT`/`ROLLBACK` trong `setRole.js`.** Với
   database nó vô tác dụng (`SET LOCAL` đã hết), nhưng nó là mốc duy nhất trong
   log cho analyzer biết vai đã hết — pgAudit không ghi `COMMIT`. Thiếu nó, kết
@@ -528,7 +581,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 103 phép thử, phải đạt hết
+bash scripts/verify.sh         # 129 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

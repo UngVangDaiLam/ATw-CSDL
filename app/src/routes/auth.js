@@ -38,7 +38,7 @@ router.post('/login', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, username, db_user, branch_id, full_name
+      `SELECT id, username, db_user, branch_id, full_name, session_token
        FROM app.verify_staff_login($1, $2)`,
       [String(username), String(password)]
     );
@@ -60,6 +60,10 @@ router.post('/login', async (req, res) => {
     }
     limiter.recordSuccess(req.ip, username);
 
+    // Dang nhap lai tren cung trinh duyet: thu hoi token cua phien cu truoc
+    // khi phien do bi bo o regenerate ben duoi.
+    await endDbSession(req.session.dbToken);
+
     // Cap MA PHIEN MOI ngay khi dang nhap thanh cong (chong session fixation):
     // neu ai do da cai san cho nan nhan mot ma phien ho biet truoc, ma do bi
     // bo di o day thay vi duoc "nang cap" thanh phien da dang nhap.
@@ -77,6 +81,14 @@ router.post('/login', async (req, res) => {
         branch_id: staff.branch_id,
         full_name: staff.full_name,
       };
+      // Token phien database (postgres/init/03_schema.sql, app.staff_sessions):
+      // RLS chi mo du lieu khi transaction mang token nay - xem
+      // middleware/setRole.js. Nam ngoai req.session.staff vi doi tuong do
+      // duoc tra ve client; token thi KHONG BAO GIO roi khoi server.
+      req.session.dbToken = staff.session_token;
+      // Moc cap token - middleware/setRole.js bat dang nhap lai truoc khi token
+      // het han, thay vi de nguoi dung thay danh sach rong.
+      req.session.loginAt = Date.now();
       // Phien moi thi token moi - token cu thuoc phien vua bi bo.
       res.json({ status: 'ok', staff: req.session.staff, csrfToken: issueCsrfToken(req) });
     });
@@ -99,8 +111,22 @@ router.get('/me', (req, res) => {
   res.json({ status: 'ok', staff: req.session.staff });
 });
 
+// Thu hoi token phien database. Loi o day khong duoc chan dang xuat: token
+// van tu het han (12 gio).
+async function endDbSession(token) {
+  if (typeof token !== 'string' || token.length === 0) return;
+  try {
+    await pool.query('SELECT app.end_staff_session($1)', [token]);
+  } catch (err) {
+    console.error('Khong thu hoi duoc token phien:', err.message);
+  }
+}
+
 // POST /auth/logout
-router.post('/logout', (req, res) => {
+router.post('/logout', async (req, res) => {
+  // Thu hoi token TRUOC khi bo phien web: tu luc nay, du ai do giu lai duoc
+  // token, RLS cung khong mo du lieu nua.
+  await endDbSession(req.session?.dbToken);
   req.session.destroy(() => {
     // Xoa phien phia server la chinh; xoa ca cookie de trinh duyet khong giu
     // ma phien cu (cung ten, cung thuoc tinh voi luc tao).

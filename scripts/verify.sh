@@ -28,7 +28,16 @@ sql_app() { docker compose exec -T postgres psql "$APP_URL" -tAc "$1" 2>&1; }
 # KHÔNG dùng `tail -1`: stdout của psql là pipe nên bị block-buffer, còn stderr
 # thì không, nên dòng ERROR thường xuất hiện TRƯỚC dòng "SET" - lấy tail -1 sẽ
 # ra "SET" và làm mọi phép thử lỗi đều trượt một cách khó hiểu.
-sql_nv() { docker compose exec -T postgres psql "$APP_URL" -tAc "SET ROLE $1; $2" 2>&1 | grep -vx 'SET'; }
+#
+# Phiên mang token đăng nhập của đúng nhân viên đó (TOK_<role>, cấp ở dưới) -
+# thiếu token thì RLS trả 0 dòng (06_rls.sql). Token đi qua PGOPTIONS, không
+# nằm trong câu SQL nên không vào log (xem scripts/staff-token.sh).
+# sql_tok <token, rỗng = không token> <role> <câu SQL>: thử ràng buộc vai-phiên.
+sql_tok() {
+    docker compose exec -T -e PGOPTIONS="-c secdb.staff_token=$1" postgres \
+        psql "$APP_URL" -tAc "SET ROLE $2; $3" 2>&1 | grep -vx 'SET'
+}
+sql_nv() { local tv="TOK_$1"; sql_tok "${!tv:-}" "$1" "$2"; }
 # psql dưới quyền analyzer_user (TCP) - role của lớp 3, chỉ INSERT audit.alerts
 sql_an() { docker compose exec -T postgres psql "postgresql://analyzer_user:${ANALYZER_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 # psql dưới quyền dashboard_user (TCP) - lớp 3 chiều đọc, chỉ SELECT audit.alerts
@@ -41,8 +50,21 @@ bad()  { FAIL=$((FAIL+1)); printf '  \033[31mTRUOT\033[0m %s\n' "$1"; printf '  
 expect() {
     if printf '%s' "$3" | grep -qF -- "$2"; then ok "$1"; else bad "$1" "$2" "$(printf '%s' "$3" | tr '\n' ' ' | cut -c1-120)"; fi
 }
+# expect_eq: như expect nhưng so KHỚP NGUYÊN VĂN. Cần cho số đếm: expect "0"
+# sẽ đạt cả khi kết quả là 2004.
+expect_eq() {
+    local got; got="$(printf '%s' "$3" | tr -d '[:space:]')"
+    if [ "$got" = "$2" ]; then ok "$1"; else bad "$1" "$2" "$(printf '%s' "$3" | tr '\n' ' ' | cut -c1-120)"; fi
+}
 
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+# Token phiên cho ba nhân viên (scripts/staff-token.sh), thu hồi khi kết thúc.
+. scripts/staff-token.sh
+trap revoke_minted_tokens EXIT
+for r in nv_hn01 nv_dn01 nv_hcm01; do
+    mint_staff_token "TOK_$r" "$r" || { echo "Khong cap duoc token phien cho $r - database da khoi tao xong chua?"; exit 1; }
+done
 
 # -----------------------------------------------------------------------------
 section "LOP 1a - pg_hba: kiem soat truy cap theo host"
@@ -59,6 +81,9 @@ expect "app_user KHONG duoc DROP TABLE"    "must be owner of table customers"   
 expect "app_user KHONG duoc TRUNCATE"      "permission denied for table customers" "$(sql_app 'TRUNCATE app.customers;')"
 expect "app_user KHONG duoc tao bang moi"  "permission denied for schema public"   "$(sql_app 'CREATE TABLE public.hacked(x int);')"
 expect "app_user KHONG cham duoc schema audit" "permission denied for schema audit" "$(sql_app 'SELECT * FROM audit.alerts;')"
+# Danh sach ban ghi moi (honeytoken): ai doc duoc la biet phai tranh dong nao.
+expect "nhan vien KHONG doc duoc danh sach ban ghi moi" "permission denied for schema audit" \
+       "$(sql_nv nv_hn01 'SELECT count(*) FROM audit.honeytokens;')"
 expect "readonly_user KHONG doc duoc payments" "permission denied for table payments" \
        "$(docker compose exec -T postgres psql "postgresql://readonly_user:${READONLY_PASSWORD}@172.28.0.10:5432/secdb" -tAc 'SELECT * FROM app.payments;' 2>&1)"
 expect "readonly_user KHONG ghi duoc" "read-only transaction" \
@@ -99,6 +124,12 @@ expect "role nghiep vu KHONG doc duoc khoa" "permission denied for schema ext" \
        "$(sql_nv nv_hn01 'SELECT ext.master_key();')"
 expect "role nghiep vu KHONG goi truc tiep pgcrypto duoc" "permission denied for schema ext" \
        "$(sql_nv nv_hn01 "SELECT ext.pgp_sym_decrypt(cccd,'x') FROM app.customers LIMIT 1;")"
+# Ban ghi moi (honeytoken) phai trong y het ban ghi that voi nguoi giai ma:
+# khong loi, ra dung CCCD. Lo ra khac biet nao la ke tan cong biet ma tranh.
+# (Lan giai ma nay CO kich hoat HONEYTOKEN_ACCESS that neu analyzer --watch
+# dang chay - dung vay, do la lan giai ma moi that.)
+expect "giai ma ban ghi moi van tra CCCD binh thuong (nguoi goi khong nhan ra)" "048280006001" \
+       "$(sql_nv nv_dn01 "SELECT app.decrypt_text(cccd) FROM app.customers WHERE email = 'kh6001@example.local';")"
 expect "readonly_user KHONG doc duoc cot cccd (quyen muc COT)" "permission denied for table customers" \
        "$(docker compose exec -T postgres psql "postgresql://readonly_user:${READONLY_PASSWORD}@172.28.0.10:5432/secdb" -tAc 'SELECT cccd FROM app.customers;' 2>&1)"
 
@@ -106,7 +137,7 @@ expect "readonly_user KHONG doc duoc cot cccd (quyen muc COT)" "permission denie
 DUMP="$(mktemp)"
 docker compose exec -T postgres pg_dump -U postgres -d "$POSTGRES_DB" > "$DUMP" 2>/dev/null
 LEAK=""
-for c in 001201000001 048202000003 079203000005 4242424242424242; do
+for c in 001201000001 048202000003 079203000005 048280006001 4242424242424242; do
     grep -qF "$c" "$DUMP" && LEAK="$LEAK $c"
 done
 [ -s secrets/pgcrypto_key ] && grep -qF "$(cat secrets/pgcrypto_key)" "$DUMP" && LEAK="$LEAK <khoa>"
@@ -155,6 +186,49 @@ if grep -rqF "$WRONG_PW" logs/ 2>/dev/null; then
 else ok "mat khau gui qua tham so KHONG xuat hien trong log"; fi
 
 # -----------------------------------------------------------------------------
+section "LOP 1f - Vai nhan vien phai di kem phien dang nhap (token)"
+# app_user la thanh vien moi role nv_* (de SET LOCAL ROLE cho tung request),
+# nen SET ROLE luon thanh cong. RLS con doi token phien cua DUNG nhan vien do -
+# thu chi co duoc bang mat khau nhan vien (06_rls.sql, app.branch_of).
+expect_eq "SET ROLE nv_dn01 KHONG co token -> 0 dong" "0" \
+          "$(sql_tok '' nv_dn01 'SELECT count(*) FROM app.customers;')"
+expect_eq "token cua nv_hn01 nhung SET ROLE nv_dn01 -> 0 dong (token gan voi nguoi)" "0" \
+          "$(sql_tok "$TOK_nv_hn01" nv_dn01 'SELECT count(*) FROM app.customers;')"
+mint_staff_token TOK_HETHAN nv_dn01 -1 || exit 1
+expect_eq "token da het han -> 0 dong" "0" \
+          "$(sql_tok "$TOK_HETHAN" nv_dn01 'SELECT count(*) FROM app.customers;')"
+# Doi chung cho ba phep thu tren: cung cau lenh, token dung -> co du lieu.
+N_DUNG="$(sql_tok "$TOK_nv_dn01" nv_dn01 'SELECT count(*) FROM app.customers;' | tr -d '[:space:]')"
+if [ "${N_DUNG:-0}" -gt 0 ] 2>/dev/null; then ok "doi chung: token dung cua nv_dn01 -> thay $N_DUNG khach hang"
+else bad "doi chung: token dung cua nv_dn01 -> co du lieu" "> 0" "${N_DUNG:-loi}"; fi
+# Dang xuat thu hoi token NGAY. Token lay tu GUC cua chinh phien - khong viet
+# vao cau lenh (se nam trong log).
+mint_staff_token TOK_THUHOI nv_dn01 || exit 1
+sql_tok "$TOK_THUHOI" app_user "SELECT app.end_staff_session(current_setting('secdb.staff_token'));" >/dev/null
+expect_eq "app.end_staff_session thu hoi token ngay -> 0 dong" "0" \
+          "$(sql_tok "$TOK_THUHOI" nv_dn01 'SELECT count(*) FROM app.customers;')"
+expect "nhan vien KHONG doc duoc bang phien" "permission denied for table staff_sessions" \
+       "$(sql_nv nv_hn01 'SELECT count(*) FROM app.staff_sessions;')"
+expect "app_user KHONG tu cap phien duoc (INSERT bang phien)" "permission denied for table staff_sessions" \
+       "$(sql_app "INSERT INTO app.staff_sessions (token_sha256, staff_id) VALUES (sha256('x'::bytea), 1);")"
+# Ham trung ten trong pg_temp se gia duoc dong LOG mao danh (context
+# "current_branch_id()") - PUBLIC khong con quyen TEMP (04_grants.sql).
+expect "KHONG tao duoc ham trong pg_temp (chan gia dong LOG mao danh)" "permission denied to create temporary tables" \
+       "$(sql_app "CREATE FUNCTION pg_temp.current_branch_id() RETURNS int LANGUAGE sql AS 'SELECT 1';")"
+# Cau lenh cham > 1s bi PostgreSQL ghi lai (log_min_duration_statement) - va
+# mac dinh ghi KEM GIA TRI THAM SO: mat khau, token phien, CCCD. Gui mot tham
+# so co dau moc qua cau cham roi tim no trong log.
+PARAM_MARK="verify_thamso_bimat_$$"
+printf '%s\n' "SELECT pg_sleep(1.2), \$1::text \\bind $PARAM_MARK \\g" \
+    | docker compose exec -T postgres psql "$APP_URL" -q >/dev/null 2>&1
+sleep 2
+if ! grep -h 'duration:' logs/*.json 2>/dev/null | grep -qF 'pg_sleep(1.2)'; then
+    bad "cau cham co tham so: tham so KHONG vao log" "co dong duration cua cau cham" "khong thay - phep thu khong co hieu luc"
+elif grep -rqF "$PARAM_MARK" logs/ 2>/dev/null; then
+    bad "cau cham co tham so: tham so KHONG vao log" "khong co" "tim thay $PARAM_MARK trong logs/ (log_parameter_max_length?)"
+else ok "cau cham co tham so: tham so KHONG vao log (log_parameter_max_length = 0)"; fi
+
+# -----------------------------------------------------------------------------
 section "LOP 3 - Giam sat bang pgAudit"
 MARK="verify_$(date +%s)"
 sql_nv nv_dn01 "SELECT '$MARK', phone FROM app.customers;" >/dev/null
@@ -184,6 +258,9 @@ expect "analyzer_user KHONG sua duoc bang chung" "permission denied for table al
        "$(sql_an 'UPDATE audit.alerts SET risk_score = 0;')"
 expect "analyzer_user KHONG cham duoc du lieu nghiep vu" "permission denied for schema app" \
        "$(sql_an 'SELECT count(*) FROM app.customers;')"
+# Analyzer bat moi qua LOG, khong can (va khong duoc) biet danh sach moi.
+expect "analyzer_user KHONG doc duoc danh sach ban ghi moi" "permission denied for table honeytokens" \
+       "$(sql_an 'SELECT count(*) FROM audit.honeytokens;')"
 
 # -----------------------------------------------------------------------------
 section "LOP 3b' - dashboard_user: chi duoc DOC canh bao, khong duoc ghi"
@@ -206,6 +283,8 @@ expect "mo READ WRITE van KHONG xoa duoc canh bao" "permission denied for table 
        "$(sql_db 'BEGIN READ WRITE; DELETE FROM audit.alerts; ROLLBACK;')"
 expect "dashboard_user KHONG cham duoc du lieu nghiep vu" "permission denied for schema app" \
        "$(sql_db 'SELECT count(*) FROM app.customers;')"
+expect "dashboard_user KHONG doc duoc danh sach ban ghi moi" "permission denied for table honeytokens" \
+       "$(sql_db 'SELECT count(*) FROM audit.honeytokens;')"
 
 # -----------------------------------------------------------------------------
 section "LOP 3c - analyzer: phat hien hanh vi bat thuong"
@@ -240,6 +319,25 @@ else
     # luu vi tri vuot qua cac dong ben duoi truoc khi dry-run kip doc.
     SINCE="$(sql_su "SELECT to_char(now() AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD HH24:MI:SS.MS');")"
     sql_nv nv_hcm01 'SELECT count(app.decrypt_text(cccd)) FROM app.customers;' >/dev/null
+    # Ban ghi moi: giai ma MOT dong - qua nho de BULK_DECRYPT de y. kh6001 la moi
+    # cua chi nhanh 2.
+    sql_nv nv_dn01 "SELECT 'verify_moi', app.decrypt_text(cccd) FROM app.customers WHERE email = 'kh6001@example.local';" >/dev/null
+    # Doi chung: giai ma ~100 khach THAT (id <= 300, moi deu co id > 6000). Co Y
+    # vuot nguong BULK_DECRYPT: cau nay CHAC CHAN co canh bao, nen "khong co
+    # HONEYTOKEN/IDENTITY" moi la ket luan - chu khong phai dat vi analyzer
+    # khong in gi ca.
+    sql_nv nv_dn01 "SELECT 'verify_khong_moi', count(app.decrypt_text(cccd)) FROM app.customers WHERE id <= 300;" >/dev/null
+    # Mao danh: SET ROLE nv_dn01 khong co token phien (mat khau app_user bi lo).
+    sql_tok '' nv_dn01 "SELECT 'verify_mao_danh', count(*) FROM app.customers;" >/dev/null
+    # Hai cach gia dong LOG mao danh de do toi nguoi vo toi (nv_hcm01):
+    #   - khoi DO tu RAISE LOG dung noi dung -> context inline_code_block;
+    #   - goi thang app.branch_of('nv_hcm01', ...) voi ten role tuy y -> ham do
+    #     KHONG ghi log (chi current_branch_id ghi, theo current_user that).
+    sql_app "DO \$\$BEGIN RAISE LOG 'SECDB_IDENTITY_WITHOUT_SESSION role=nv_hcm01 ly_do=khong_co_token'; END\$\$;" >/dev/null
+    sql_app "SELECT * FROM app.branch_of('nv_hcm01', 'doan_bua');" >/dev/null
+    # Ne trach nhiem: nv_hn01 CO token dung, chen loi goi branch_of cho vai khac
+    # vao cau lenh cua minh. Canh bao cua cau nay van phai quy cho nv_hn01.
+    sql_nv nv_hn01 "SELECT 'verify_ne_trach', count(app.decrypt_text(cccd)) FROM app.customers WHERE id <= 300 AND (SELECT branch_id FROM app.branch_of('nv_dn01', current_setting('secdb.staff_token'))) IS NULL;" >/dev/null
     # Cau nay bi TU CHOI (password_hash): pgAudit khong ghi AUDIT, analyzer phai
     # doc dong ERROR 42501 moi thay (ACCESS_DENIED, xem sessions.js).
     sql_nv nv_hcm01 "SELECT full_name FROM app.customers WHERE cccd_hash = app.blind_index('079203000005') UNION SELECT password_hash FROM app.staff;" >/dev/null
@@ -255,7 +353,7 @@ else
     #   that:      co RESET ROLE nhu setRole.js -> analyzer tra vai -> khong gan nham.
     login_after_request() {
         printf "BEGIN;\nSET LOCAL ROLE nv_dn01;\nSELECT id FROM app.customers WHERE id = 1;\nCOMMIT;\n%s\nSELECT username FROM app.staff WHERE username = '%s';\n" "$1" "$2" \
-            | docker compose exec -T postgres psql "$APP_URL" -q >/dev/null 2>&1
+            | docker compose exec -T -e PGOPTIONS="-c secdb.staff_token=$TOK_nv_dn01" postgres psql "$APP_URL" -q >/dev/null 2>&1
     }
     login_after_request "" "verify_khong_reset"
     login_after_request "RESET ROLE;" "verify_co_reset"
@@ -277,6 +375,39 @@ else
     ANALYZER_OUT="$("${ANALYZER_CMD[@]}" --dry-run --since="$SINCE" 2>&1)"
 
     expect "analyzer phat hien giai ma hang loat" "BULK_DECRYPT" "$ANALYZER_OUT"
+    # Moi canh bao in 3 dong: [diem] RULE nguoi | mo ta | cau lenh.
+    expect "giai ma MOT ban ghi moi -> HONEYTOKEN_ACCESS, quy cho nv_dn01" "nv_dn01" \
+           "$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_moi'" | grep 'HONEYTOKEN_ACCESS')"
+    # Doi chung: khoi canh bao cua cau 'verify_khong_moi' (moi canh bao 3 dong).
+    KHONG_MOI="$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_khong_moi'")"
+    if ! printf '%s' "$KHONG_MOI" | grep -q 'BULK_DECRYPT.*nv_dn01'; then
+        bad "doi chung: giai ma ~100 khach that -> BULK_DECRYPT cho nv_dn01 (phep doi chung co hieu luc)" \
+            "BULK_DECRYPT nv_dn01" "$(printf '%s' "$KHONG_MOI" | head -1 | cut -c1-120)"
+    else ok "doi chung: giai ma ~100 khach that -> BULK_DECRYPT cho nv_dn01 (phep doi chung co hieu luc)"; fi
+    if printf '%s' "$KHONG_MOI" | grep -q 'HONEYTOKEN_ACCESS'; then
+        bad "doi chung: giai ma khach that KHONG kich hoat HONEYTOKEN_ACCESS" "khong co" "co canh bao"
+    else ok "doi chung: giai ma khach that KHONG kich hoat HONEYTOKEN_ACCESS"; fi
+    # Mao danh vai: canh bao quy cho app_user (danh tinh da xac thuc that), KHONG
+    # cho nv_dn01 - nhan vien bi mao danh khong lam gi; ten vai nam o mo ta.
+    expect "SET ROLE khong token -> IDENTITY_WITHOUT_SESSION, quy cho app_user" "app_user" \
+           "$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_mao_danh'" | grep 'IDENTITY_WITHOUT_SESSION')"
+    expect "canh bao mao danh ghi ro vai bi mao danh (nv_dn01)" "nv_dn01" \
+           "$(printf '%s' "$ANALYZER_OUT" | grep -A1 'IDENTITY_WITHOUT_SESSION' | grep 'khong co token')"
+    if printf '%s' "$ANALYZER_OUT" | grep -A1 'IDENTITY_WITHOUT_SESSION' | grep -q 'nv_hcm01'; then
+        bad "KHONG gia duoc canh bao mao danh nv_hcm01 (khoi DO, goi thang branch_of)" "khong co canh bao nv_hcm01" "co"
+    else ok "KHONG gia duoc canh bao mao danh nv_hcm01 (khoi DO, goi thang branch_of)"; fi
+    if printf '%s' "$KHONG_MOI" | grep -q 'IDENTITY_WITHOUT_SESSION'; then
+        bad "doi chung: co token dung KHONG bi coi la mao danh" "khong co" "co canh bao"
+    else ok "doi chung: co token dung KHONG bi coi la mao danh"; fi
+    NE_TRACH="$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_ne_trach'")"
+    if printf '%s' "$NE_TRACH" | grep -q 'BULK_DECRYPT.*nv_hn01' && ! printf '%s' "$NE_TRACH" | grep -q 'app_user'; then
+        ok "chen loi goi branch_of cho vai khac KHONG day duoc trach nhiem sang app_user"
+    else bad "chen loi goi branch_of cho vai khac KHONG day duoc trach nhiem sang app_user" \
+             "BULK_DECRYPT nv_hn01, khong co app_user" "$(printf '%s' "$NE_TRACH" | grep -E '^\[' | tr '\n' ' ' | cut -c1-120)"; fi
+    # Quet ca bang cua nv_hcm01 (chi nhanh 3) cham dung 2 moi cua chi nhanh do -
+    # RLS gioi han ca so moi bi cham, khong chi so ban ghi that.
+    expect "quet ca bang: dem dung so moi cua chi nhanh 3 (2)" "Giai ma 2 ban ghi moi" \
+           "$(printf '%s' "$ANALYZER_OUT" | grep -A1 'HONEYTOKEN_ACCESS.*nv_hcm01')"
     expect "analyzer phat hien dau vet UNION SELECT" "SQLI_UNION" "$ANALYZER_OUT"
     expect "analyzer phat hien truy cap bang chua password_hash" "STAFF_CREDENTIAL_READ" "$ANALYZER_OUT"
     # Tan cong bi lop 1 chan van phai hien o lop 3, va van quy dung nguoi.
@@ -510,6 +641,23 @@ else bad "app phuc vu giao dien web cung origin, co CSP" "<title>SecDB · Quản
 expect "API du lieu tra ve Cache-Control: no-store" "no-store" \
        "$(curl -s -D - -o /dev/null "$WEB/customers" 2>&1 | tr -d '\r' | grep -i '^cache-control')"
 
+# Token phien la thu mo du lieu - lot vao log (file ma analyzer va ai co
+# quyen doc /var/log deu doc duoc) la mat tac dung. App gan token bang tham
+# so $1 cua set_config(), pgAudit ghi <not logged> thay cho gia tri.
+sleep 2
+SETCFG="$(grep -h "set_config('secdb.staff_token'" logs/*.csv 2>/dev/null | grep -F 'AUDIT')"
+if [ -z "$SETCFG" ]; then
+    bad "app gan token phien bang tham so (log ghi <not logged>)" "co dong set_config cua app" "khong thay - app chua dang nhap duoc?"
+elif printf '%s' "$SETCFG" | grep -vqF '<not logged>'; then
+    bad "app gan token phien bang tham so (log ghi <not logged>)" "<not logged>" "$(printf '%s' "$SETCFG" | grep -vF '<not logged>' | head -1 | cut -c1-120)"
+else ok "app gan token phien bang tham so (log ghi <not logged>)"; fi
+LEAK_TOK=""
+for t in "$TOK_nv_hn01" "$TOK_nv_dn01" "$TOK_nv_hcm01" "$TOK_HETHAN" "$TOK_THUHOI"; do
+    grep -rqF "$t" logs/ 2>/dev/null && LEAK_TOK="$LEAK_TOK ${t:0:8}..."
+done
+if [ -z "$LEAK_TOK" ]; then ok "token phien KHONG xuat hien trong log"
+else bad "token phien KHONG xuat hien trong log" "khong co" "tim thay:$LEAK_TOK"; fi
+
 # -----------------------------------------------------------------------------
 section "DU LIEU - khoi luong theo yeu cau de bai"
 N_CUST=$(sql_su 'SELECT count(*) FROM app.customers;')
@@ -527,6 +675,14 @@ expect "ca 3 chi nhanh deu co khach hang" "3" \
        "$(sql_su 'SELECT count(DISTINCT branch_id) FROM app.customers;')"
 expect "khong co don hang nao lech chi nhanh so voi khach hang" "0" \
        "$(sql_su 'SELECT count(*) FROM app.orders o JOIN app.customers c ON c.id = o.customer_id WHERE o.branch_id <> c.branch_id;')"
+# Moi trai ca 3 chi nhanh, va moi muc trong audit.honeytokens tro dung mot
+# ciphertext dang co that (neu khong thi app.decrypt_text() khong bao gio trung).
+expect "6 ban ghi moi, trai deu 3 chi nhanh, deu khop ciphertext that" "6|3" \
+       "$(sql_su 'SELECT count(*) || chr(124) || count(DISTINCT c.branch_id) FROM audit.honeytokens h JOIN app.customers c ON sha256(c.cccd) = h.cipher_sha256;')"
+# Nguy trang: khach that nao cung co don hang; moi khong co thi loc
+# "khach khong co don" la loai duoc moi ra.
+expect "ban ghi moi co don hang nhu khach that (khong loc ra duoc)" "0" \
+       "$(sql_su 'SELECT count(*) FROM audit.honeytokens h JOIN app.customers c ON sha256(c.cccd) = h.cipher_sha256 WHERE NOT EXISTS (SELECT 1 FROM app.orders o WHERE o.customer_id = c.id);')"
 
 # -----------------------------------------------------------------------------
 section "LOP 4 - WAL archiving"

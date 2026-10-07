@@ -1,8 +1,13 @@
 # app/
 
 Backend Express demo, kết nối PostgreSQL bằng `app_user` rồi `SET LOCAL ROLE
-nv_xxx` cho từng request (mô hình định danh ở `postgres/init/06_rls.sql` và
-CLAUDE.md mục "RLS"). Cố ý còn 2 lỗ hổng ở tầng ứng dụng để chứng minh các lớp
+nv_xxx` cho từng request, kèm **token phiên đăng nhập** của nhân viên đó
+(mô hình định danh ở `postgres/init/06_rls.sql` và CLAUDE.md mục "RLS").
+Token do `app.verify_staff_login()` cấp lúc đăng nhập, nằm trong session phía
+server (`req.session.dbToken`, KHÔNG trong `req.session.staff` vì đối tượng đó
+trả về client), gắn vào transaction bằng `set_config('secdb.staff_token', $1,
+true)` ở `middleware/setRole.js`, thu hồi bằng `app.end_staff_session()` khi
+đăng xuất. Thiếu token thì RLS trả 0 dòng. Cố ý còn 2 lỗ hổng ở tầng ứng dụng để chứng minh các lớp
 bảo vệ ở tầng database (RLS, whitelist bảng, mã hóa cột) vẫn chặn được ngay cả
 khi code app có lỗi — xem "Lỗ hổng cố ý" bên dưới.
 

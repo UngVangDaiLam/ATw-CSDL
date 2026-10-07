@@ -7,7 +7,9 @@
 --
 -- Mô hình định danh: ứng dụng kết nối bằng app_user (một pool duy nhất) rồi
 -- `SET ROLE nv_xxx` ở đầu mỗi request. current_user khi đó là nv_xxx, nên
--- policy tra được chi nhánh qua app.staff.db_user.
+-- policy tra được chi nhánh qua app.staff.db_user - NHƯNG chỉ khi transaction
+-- mang token phiên đăng nhập còn hạn của chính nv_xxx (app.staff_sessions,
+-- 03_schema.sql). SET ROLE thôi thì không đủ.
 -- =============================================================================
 
 SET ROLE db_owner;
@@ -22,11 +24,13 @@ SET search_path = app, audit, ext, public;
 -- khớp, và MỌI role đều đọc ra 0 dòng. Triệu chứng nhìn hệt như "RLS chặn
 -- đúng", nên rất dễ tưởng là đã xong.
 --
---   app.branch_of(text)      SECURITY DEFINER - chạy dưới quyền db_owner nên
---                            đọc được app.staff mà người gọi không cần quyền
---                            SELECT trên bảng đó.
+--   app.branch_of(text,text) SECURITY DEFINER - chạy dưới quyền db_owner nên
+--                            đọc được app.staff + app.staff_sessions mà người
+--                            gọi không cần quyền SELECT trên hai bảng đó.
 --   app.current_branch_id()  SECURITY INVOKER (mặc định) - giữ đúng danh tính
---                            người gọi, lấy current_user rồi truyền sang.
+--                            người gọi, lấy current_user rồi truyền sang. Cũng
+--                            là nơi DUY NHẤT ghi dòng LOG mạo danh - vì chỉ
+--                            nó biết chắc vai thật của phiên.
 --
 -- STABLE: policy được gọi trên TỪNG DÒNG. Không có STABLE thì Postgres gọi
 -- lại hàm cho mỗi dòng thay vì cache trong một câu lệnh.
@@ -35,31 +39,93 @@ SET search_path = app, audit, ext, public;
 -- tạo được một bảng tên `staff` ở schema đứng trước trong search_path là
 -- chiếm được quyền db_owner.
 -- -----------------------------------------------------------------------------
-CREATE FUNCTION app.branch_of(p_db_user text) RETURNS int
-    LANGUAGE sql
+CREATE FUNCTION app.branch_of(p_db_user text, p_token text,
+                              OUT branch_id int, OUT ly_do text)
+    LANGUAGE plpgsql
     STABLE
     SECURITY DEFINER
     SET search_path = app, pg_catalog
 AS $$
-    SELECT branch_id
-    FROM   app.staff
-    WHERE  db_user = p_db_user
-      AND  is_active
-    LIMIT  1;
-$$;
+-- RÀNG BUỘC VAI VỚI PHIÊN ĐĂNG NHẬP (app.staff_sessions, 03_schema.sql).
+--
+-- branch_id: chi nhánh, CHỈ khi p_token là token còn hạn của đúng nhân viên
+--   mang role p_db_user, và nhân viên đó còn hoạt động. Quyền thành viên role
+--   (thứ app_user có với MỌI nv_*) không còn đủ: phải có token, mà token chỉ
+--   cấp khi nhập đúng mật khẩu nhân viên (app.verify_staff_login).
+-- ly_do: vì sao branch_id là NULL - chỉ điền khi p_db_user là role của một
+--   nhân viên (readonly_user, app_user chưa SET ROLE, db_owner: không phải).
+--
+-- Hàm này KHÔNG tự ghi log. Ai cũng gọi thẳng được nó với tên role tùy ý; nếu
+-- nó RAISE LOG thì ai cũng sinh được dòng "nv_hcm01 bị mạo danh" mang đúng
+-- context mà analyzer tin. Việc ghi log nằm ở app.current_branch_id() bên
+-- dưới - hàm đó tự lấy current_user, không nhận tên role từ ngoài vào.
+DECLARE
+    v_owner  text;
+    v_live   boolean;
+    v_active boolean;
+    v_branch int;
+BEGIN
+    IF p_token IS NOT NULL AND p_token <> '' THEN
+        SELECT s.db_user, t.expires_at > now(), s.is_active, s.branch_id
+          INTO v_owner, v_live, v_active, v_branch
+          FROM app.staff_sessions t
+          JOIN app.staff s ON s.id = t.staff_id
+         WHERE t.token_sha256 = sha256(convert_to(p_token, 'UTF8'));
+        IF v_owner = p_db_user AND v_live AND v_active THEN
+            branch_id := v_branch;
+            RETURN;
+        END IF;
+    END IF;
 
+    IF EXISTS (SELECT 1 FROM app.staff WHERE db_user = p_db_user) THEN
+        ly_do := CASE WHEN p_token IS NULL OR p_token = '' THEN 'khong_co_token'
+                      WHEN v_owner IS NULL                  THEN 'token_khong_ton_tai'
+                      WHEN v_owner <> p_db_user             THEN 'token_cua_nguoi_khac'
+                      WHEN NOT v_active                     THEN 'nhan_vien_bi_khoa'
+                      ELSE                                       'token_het_han' END;
+    END IF;
+END $$;
+
+-- Hàm mà policy gọi. SECURITY INVOKER: current_user là vai THẬT của phiên, nên
+-- dòng LOG dưới đây không giả được bằng cách truyền tên role khác vào.
+--
+-- Token lấy từ GUC secdb.staff_token mà app đặt trong transaction bằng tham số
+-- (app/src/middleware/setRole.js). missing_ok = true: chưa đặt thì NULL.
+-- GUC đọc được bằng current_setting() trong chính phiên đó - SQL Injection
+-- trong một request chỉ thấy token của CHÍNH người gửi request.
+--
+-- Vai nhân viên mà không có phiên hợp lệ: trả NULL (RLS -> 0 dòng) và ghi một
+-- dòng LOG cho lớp 3 - rule IDENTITY_WITHOUT_SESSION của analyzer:
+--   - RAISE LOG chỉ vào log server, KHÔNG gửi về client (LOG thấp hơn NOTICE
+--     theo client_min_messages) - người gọi chỉ thấy 0 dòng.
+--   - Trường `context` là "PL/pgSQL function current_branch_id() line N at
+--     RAISE" (không kèm tên schema). Khối DO tự RAISE LOG mang context
+--     "inline_code_block"; hàm trùng tên trong pg_temp không tạo được vì
+--     PUBLIC không có quyền TEMP (04_grants.sql).
+--   - Không bao giờ ghi giá trị token vào log.
+--
+-- plpgsql thay vì sql: cần RAISE. Thân hàm không còn hiện trong log pgAudit
+-- (biểu thức plpgsql đơn giản không qua executor) - không rule nào cần nó.
 CREATE FUNCTION app.current_branch_id() RETURNS int
-    LANGUAGE sql
+    LANGUAGE plpgsql
     STABLE
     SET search_path = app, pg_catalog
 AS $$
-    SELECT app.branch_of(current_user::text);
-$$;
+DECLARE
+    v_role text := current_user;
+    r      record;
+BEGIN
+    SELECT * INTO r FROM app.branch_of(v_role, current_setting('secdb.staff_token', true));
+    IF r.ly_do IS NOT NULL THEN
+        RAISE LOG 'SECDB_IDENTITY_WITHOUT_SESSION role=% ly_do=%', v_role, r.ly_do;
+    END IF;
+    RETURN r.branch_id;
+END $$;
 
-REVOKE ALL ON FUNCTION app.branch_of(text)        FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.branch_of(text, text)  FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.current_branch_id()    FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION app.branch_of(text)     TO staff_role, app_user, readonly_user;
-GRANT EXECUTE ON FUNCTION app.current_branch_id() TO staff_role, app_user, readonly_user;
+GRANT EXECUTE ON FUNCTION app.branch_of(text, text) TO staff_role, app_user, readonly_user;
+GRANT EXECUTE ON FUNCTION app.current_branch_id()   TO staff_role, app_user, readonly_user;
 
 -- -----------------------------------------------------------------------------
 -- Bật RLS.
@@ -101,8 +167,9 @@ ALTER TABLE app.payments  FORCE  ROW LEVEL SECURITY;
 -- app_user nằm trong danh sách TO nhưng KHÔNG có dòng nào trong app.staff,
 -- nên app.current_branch_id() trả NULL và `branch_id = NULL` cho ra NULL -
 -- không phải TRUE - tức app_user đọc ra 0 dòng. Đây là chủ đích: chiếm được
--- mật khẩu app_user vẫn chưa lấy được dữ liệu, còn phải SET ROLE, mà SET ROLE
--- thì bị pgAudit ghi lại.
+-- mật khẩu app_user vẫn chưa lấy được dữ liệu. SET ROLE sang nv_xxx cũng chưa
+-- đủ - còn thiếu token phiên của nv_xxx, thứ chỉ có được bằng mật khẩu của
+-- chính nhân viên đó; và lần thử ấy để lại dòng LOG cho analyzer.
 --
 -- VÌ SAO `(SELECT app.current_branch_id())` CHỨ KHÔNG GỌI HÀM TRỰC TIẾP:
 -- Gọi thẳng thì khi planner dùng được index trên branch_id, hàm chạy 1 lần
@@ -148,9 +215,19 @@ RESET ROLE;
 -- sẽ chạy dưới danh tính của người trước - lỗ hổng nghiêm trọng và rất khó
 -- phát hiện vì nó chỉ xuất hiện khi pool tái sử dụng connection.
 --
--- Giới hạn đã biết của mô hình này: app_user là thành viên của cả ba role
--- nv_*, nên chiếm được app_user thì SET ROLE sang chi nhánh nào cũng được.
--- Không thể loại bỏ hoàn toàn nếu vẫn muốn dùng một pool chung. Giảm thiểu:
--- mọi lần SET ROLE đều nằm trong log pgAudit, và analyzer ở lớp 3 sẽ bắt mẫu
--- bất thường (một phiên đổi vai nhiều lần, đổi vai ngoài giờ làm việc...).
+-- app_user là thành viên của cả ba role nv_*, nên chiếm được app_user thì SET
+-- ROLE sang chi nhánh nào cũng được. Trước đây đó là giới hạn "không thể loại
+-- bỏ nếu vẫn dùng một pool chung". Nay RLS còn đòi token phiên của đúng nhân
+-- viên đó (app.branch_of ở trên): SET ROLE được nhưng đọc ra 0 dòng, và để lại
+-- dòng LOG SECDB_IDENTITY_WITHOUT_SESSION cho analyzer.
+--
+-- Mỗi transaction của app vì vậy là:
+--     BEGIN;
+--     SET LOCAL ROLE nv_hn01;
+--     SELECT set_config('secdb.staff_token', $1, true);   -- $1: token, THAM SỐ
+--     ... truy vấn ...
+--     COMMIT;
+-- Token phải đi qua tham số: viết thẳng vào câu SQL là nó nằm nguyên văn trong
+-- log pgAudit. Và KHÔNG dùng `SET LOCAL secdb.staff_token = '...'` - câu SET
+-- không tham số hóa được, và class misc_set ghi nó vào log.
 -- =============================================================================

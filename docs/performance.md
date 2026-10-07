@@ -17,6 +17,8 @@ của lượt đo ngày 2026-09-26 (PostgreSQL 16.15 trong Docker Desktop/Window
 | 2 | Mã hóa khi ghi (+ blind index) | 0,5 → 3,3 ms mỗi INSERT (×7) | Chấp nhận được — ghi khách hàng mới không phải thao tác tần suất cao |
 | 2 | Blind index so với giải mã để tìm | 2,7 ms so với **2 777 ms** (×1 000) | Blind index là **bắt buộc**, không phải tối ưu |
 | 3 | pgAudit | ×3 latency, **~5,5 KB log/giao dịch** | Chi phí lớn nhất ở tầng I/O log, cần kế hoạch lưu trữ |
+| 1 | Token phiên trong policy RLS (tra `app.staff_sessions`) | Không đo được khác biệt (+6% / +23% so với +2% / +24% trước đó, trong biên nhiễu); app thêm **1 câu lệnh/request** | Xem mục 6 |
+| 2+3 | Tra bản ghi mồi (honeytoken) trong mỗi lần giải mã | **~4,4 µs/lần** (~0,3% của một lần giải mã), 0 dòng log thêm khi không trúng | Không đo được qua `benchmark.sh` — chìm trong nhiễu ±30%. Xem mục 5 |
 
 ## 1. RLS — phát hiện và sửa một lỗi hiệu năng
 
@@ -103,7 +105,8 @@ blind index phần lớn cũng là đọc file pepper — cùng lý do như mụ
 
 Cùng một workload backend (`SET LOCAL ROLE` + đọc 1 khách + đọc đơn hàng của
 khách đó), bật pgAudit làm latency tăng **×3,3** và sinh **~5,5 KB log mỗi giao
-dịch**. Một giao dịch sinh 7 dòng AUDIT:
+dịch**. Một giao dịch sinh 7 dòng AUDIT (phiên superuser của benchmark — đường
+app thật chỉ có 5, xem mục 6):
 
 ```
 MISC,SET   SET LOCAL ROLE nv_hn01
@@ -130,6 +133,62 @@ Các cách giảm và cái giá phải trả:
 
 Lab giữ nguyên cấu hình: mục tiêu là quan sát được đầy đủ, và chi phí đã được
 đo, không phải ước đoán.
+
+## 5. Bản ghi mồi (honeytoken) — chi phí gần như bằng 0
+
+Từ 2026-10-07, mỗi lần `app.decrypt_text()` gọi thêm `audit.is_honeytoken()`:
+một lần `sha256()` trên ciphertext và một lần dò khóa chính
+`audit.honeytokens` (6 dòng). Đo riêng phần này bằng superuser, tắt pgAudit
+trong phiên:
+
+```sql
+SET pgaudit.log = 'none';
+SELECT count(*) FILTER (WHERE audit.is_honeytoken(cccd)) FROM app.customers;
+-- 26,6 ms cho 6 011 dòng  ->  ~4,4 µs mỗi lần, so với ~1 400 µs mỗi lần giải mã
+```
+
+Hai lượt `benchmark.sh` chạy ngay sau thay đổi cho B2 (giải mã 100 dòng) là
+177 ms rồi 115 ms — hai lượt cùng mã nguồn lệch nhau 50%, nên con số ~0,3%
+chỉ đo được bằng cách tách riêng như trên.
+
+Về log: phần tra mồi chạm bảng bên trong hàm `SECURITY DEFINER`, mà pgAudit tự
+giấu loại câu lệnh này với phiên `app_user` (xem `05_crypto.sql`, BẪY 1) — nên
+giải mã dòng thường **không sinh thêm dòng log nào**. Chỉ khi trúng mồi mới có
+thêm đúng một dòng lồng nhau (thân `audit.honeytoken_tripped`).
+
+## 6. Token phiên trong RLS — không đo được khác biệt
+
+Từ 2026-10-07, `app.branch_of()` không chỉ tra `app.staff` theo `current_user`
+mà join thêm `app.staff_sessions` theo SHA-256 của token (khóa chính), và trở
+thành plpgsql để `RAISE LOG` khi vai không kèm token. Hàm chạy MỘT lần mỗi câu
+lệnh (InitPlan, mục 1), nên chi phí không nhân theo số dòng.
+
+| Lượt | A2 quét chi nhánh có RLS | A4 tra 1 dòng có RLS |
+|---|---|---|
+| Trước token | +2% | +24% |
+| Sau token | +6% | +23% |
+
+Chênh lệch nằm trong biên nhiễu ±30%. Phía app: mỗi request thêm một câu
+`SELECT set_config('secdb.staff_token', $1, true)` — một round-trip trong mạng
+Docker nội bộ, và **một** dòng AUDIT (giá trị token ghi `<not logged>`).
+
+**Lưu ý khi đọc dòng D của `benchmark-results.md`.** Benchmark chạy bằng
+superuser qua socket, mà pgAudit chỉ giấu câu lồng nhau có chạm bảng bên trong
+hàm `SECURITY DEFINER` khi session user không phải thành viên của chủ hàm
+(`05_crypto.sql`, BẪY 1) — superuser là thành viên của mọi role. Nên dòng D
+thấy cả các lần `branch_of` đọc `app.staff` và `app.staff_sessions`, những thứ
+phiên `app_user` thật không bao giờ ghi. Đếm trực tiếp cùng một giao dịch D:
+
+| Phiên | Dòng AUDIT / giao dịch |
+|---|---|
+| `app_user` qua TCP (đường app thật) | **5** (+1 dòng `set_config` của app) |
+| superuser qua socket (benchmark) | 9 (trước khi có token: 7) |
+
+Vì vậy KB log/giao dịch ở dòng D (8,7 KB sau token, 5,5 KB trước) **phóng đại**
+log thật của app; con số "7 dòng" ở mục 4 cũng là của phiên superuser. Muốn
+đo log thật phải chạy D bằng `app_user` — nhưng khi đó không đặt được
+`pgaudit.log = none` cho lượt mốc (tham số chỉ superuser đổi được), nên cặp so
+sánh mất tính đối xứng.
 
 ## Chạy lại
 

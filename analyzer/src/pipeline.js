@@ -37,6 +37,10 @@ function evaluate(stmt) {
         // thay ro no KHAC voi db_user o tren - do chinh la cho ma viec bam theo
         // phien tao ra gia tri.
         session_user: stmt.sessionUser,
+        // Vai da SET ROLE nhung khong co token phien cua nhan vien do - canh bao
+        // vi vay quy cho session user, khong quy cho nhan vien bi mao danh
+        // (sessions.js, VAN DE 3).
+        ...(stmt.unverifiedRole ? { vai_khong_co_phien: stmt.unverifiedRole } : {}),
         client: stmt.remoteHost,
         ung_dung: stmt.appName,
         thoi_diem: stmt.timestamp,

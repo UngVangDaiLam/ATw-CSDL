@@ -31,13 +31,28 @@ if [ -z "$ANALYZER_IN_DOCKER" ]; then
 fi
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
-# Chạy dưới danh tính một nhân viên, như backend làm cho mỗi request.
-as_nv() { docker compose exec -T postgres psql "$APP_URL" -tAc "SET ROLE $1; $2" >/dev/null 2>&1 || true; }
+# Chạy dưới danh tính một nhân viên, như backend làm cho mỗi request: SET ROLE
+# + token phiên đăng nhập của đúng người đó (scripts/staff-token.sh). Thiếu
+# token thì RLS trả 0 dòng và mọi hành vi bên dưới chỉ còn là IDENTITY_WITHOUT_SESSION.
+. scripts/staff-token.sh
+trap revoke_minted_tokens EXIT
+for r in nv_hn01 nv_dn01 nv_hcm01; do mint_staff_token "TOK_$r" "$r"; done
+as_nv() {
+    local tv="TOK_$1"
+    docker compose exec -T -e PGOPTIONS="-c secdb.staff_token=${!tv}" postgres \
+        psql "$APP_URL" -tAc "SET ROLE $1; $2" >/dev/null 2>&1 || true
+}
 
 echo "==> Dien lai cac hanh vi bat thuong"
 
 echo "    nv_hcm01: giai ma CCCD hang loat               -> BULK_DECRYPT"
 as_nv nv_hcm01 'SELECT app.decrypt_text(cccd) FROM app.customers;'
+
+echo "    nv_dn01 : mo ho so MOT khach hang moi            -> HONEYTOKEN_ACCESS"
+as_nv nv_dn01 "SELECT full_name, app.decrypt_text(cccd) FROM app.customers WHERE email = 'kh6001@example.local';"
+
+echo "    app_user: SET ROLE nv_hn01 KHONG co token phien   -> IDENTITY_WITHOUT_SESSION"
+docker compose exec -T postgres psql "$APP_URL" -tAc 'SET ROLE nv_hn01; SELECT count(*) FROM app.customers;' >/dev/null 2>&1 || true
 
 echo "    nv_dn01 : UNION SELECT doc password_hash (bi chan) -> SQLI_UNION + ACCESS_DENIED"
 as_nv nv_dn01 "SELECT full_name FROM app.customers WHERE full_name LIKE '%x%' UNION SELECT password_hash FROM app.staff;"

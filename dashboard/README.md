@@ -98,6 +98,8 @@ Các rule và gợi ý màu:
 
 | `rule_triggered` | Điểm | Nghĩa |
 |------|------|------|
+| `IDENTITY_WITHOUT_SESSION` | 50–95 | `SET ROLE` sang vai nhân viên mà không có token phiên của người đó — `db_user` là `app_user`, vai bị mạo danh ở `detail.vai_khong_co_phien` |
+| `HONEYTOKEN_ACCESS` | 98 | giải mã CCCD của khách hàng mồi (honeytoken) — một dòng là đủ |
 | `SQLI_UNION` | 90 | câu lệnh có `UNION ... SELECT` |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã hàng loạt CCCD |
 | `SQLI_TAUTOLOGY` | 85 | `OR 1=1`, `OR 'a'='a'` |
@@ -125,7 +127,9 @@ Các khóa thường có trong `detail`:
 | `client` | IP nguồn |
 | `session_id`, `pid` | đối chiếu với log thô |
 | `bang` | các bảng câu lệnh chạm tới, vd. `["app.customers"]` |
-| `so_ban_ghi_giai_ma` | chỉ có ở `BULK_DECRYPT` — số bản ghi đã bị giải mã |
+| `so_ban_ghi_giai_ma` | ở `BULK_DECRYPT` và `HONEYTOKEN_ACCESS` — số bản ghi đã bị giải mã |
+| `vai_khong_co_phien`, `ly_do` | chỉ có ở cảnh báo trong khoảng vai mạo danh — vai bị mạo danh và lý do (`khong_co_token`, `token_cua_nguoi_khac`...) |
+| `so_ban_ghi_moi` | chỉ có ở `HONEYTOKEN_ACCESS` — trong đó bao nhiêu bản ghi là mồi |
 | `gio`, `thu_trong_tuan` | chỉ có ở `AFTER_HOURS` |
 
 `detail` được analyzer ghi — **coi như dữ liệu không tin cậy** khi render: câu

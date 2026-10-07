@@ -5,10 +5,18 @@ import { RULES, formatDateTime, formatLogTime, ruleLabel } from '../lib/alerts.j
 
 // Các khóa đã có chỗ hiển thị riêng — phần còn lại của detail rơi xuống bảng
 // "Trường khác" để không mất thông tin khi analyzer thêm khóa mới.
-const SHOWN = new Set(['mo_ta', 'cau_lenh', 'thoi_diem', 'session_user', 'client', 'session_id', 'pid', 'bang', 'so_ban_ghi_giai_ma', 'gio', 'thu_trong_tuan', 'nguon', 'tai_khoan', 'so_lan', 'su_kien', 'duong_dan', 'khoa_theo', 'ly_do', 'phien_cua']);
+const SHOWN = new Set(['mo_ta', 'cau_lenh', 'thoi_diem', 'session_user', 'client', 'session_id', 'pid', 'bang', 'so_ban_ghi_giai_ma', 'so_ban_ghi_moi', 'gio', 'thu_trong_tuan', 'nguon', 'tai_khoan', 'so_lan', 'su_kien', 'duong_dan', 'khoa_theo', 'ly_do', 'phien_cua', 'vai_khong_co_phien']);
 // Nhan tieng Viet cho cac truong cua canh bao tu tang web (analyzer/src/appEvents.js).
 const WEB_LABELS = { su_kien: 'Sự kiện', duong_dan: 'Request', khoa_theo: 'Khóa theo', ly_do: 'Lý do chặn', phien_cua: 'Phiên đăng nhập kèm theo' };
 const WEB_VALUES = { tai_khoan: 'cặp (IP, tài khoản)', ip: 'cả địa chỉ IP', content_type: 'gửi dạng form, không phải JSON', token_missing: 'thiếu CSRF token', token_mismatch: 'sai CSRF token' };
+// Ly do cua IDENTITY_WITHOUT_SESSION (postgres/init/06_rls.sql, app.branch_of).
+const IDENTITY_REASONS = {
+  khong_co_token: 'không có token phiên',
+  token_khong_ton_tai: 'token không tồn tại / đã thu hồi',
+  token_cua_nguoi_khac: 'token của nhân viên khác',
+  token_het_han: 'token đã hết hạn',
+  nhan_vien_bi_khoa: 'nhân viên đã bị khóa',
+};
 const WEEKDAYS = ['Chủ nhật', 'Thứ hai', 'Thứ ba', 'Thứ tư', 'Thứ năm', 'Thứ sáu', 'Thứ bảy'];
 
 function asText(v) {
@@ -89,6 +97,27 @@ export default function AlertDrawer({ alert, onClose }) {
                     cảnh báo. App không có quyền gì trên bảng cảnh báo.
                   </p>
                 </>
+              ) : d.vai_khong_co_phien ? (
+                <>
+                  <h3 className="drawer-section">Ai đã làm?</h3>
+                  <div className="identity">
+                    <div className="identity-box identity-real">
+                      <span className="identity-label">Tài khoản kết nối</span>
+                      <span className="identity-value">{asText(d.session_user ?? alert.db_user)}</span>
+                      <span className="identity-note">từ {asText(d.client)}</span>
+                    </div>
+                    <Icon name="chevron" className="identity-arrow" />
+                    <div className="identity-box">
+                      <span className="identity-label">Vai bị mạo danh</span>
+                      <span className="identity-value">{asText(d.vai_khong_co_phien)}</span>
+                      <span className="identity-note">không có phiên đăng nhập</span>
+                    </div>
+                  </div>
+                  <p className="identity-caption">
+                    <code>SET ROLE</code> thành công nhưng không có token phiên của nhân viên này, nên RLS trả 0 dòng.
+                    Nhân viên đó không làm gì — cảnh báo quy cho tài khoản kết nối.
+                  </p>
+                </>
               ) : (
                 <>
                   <h3 className="drawer-section">Ai đã làm?</h3>
@@ -129,6 +158,9 @@ export default function AlertDrawer({ alert, onClose }) {
                 {d.so_ban_ghi_giai_ma !== undefined && (
                   <Field label="Bản ghi bị giải mã"><strong className="text-danger">{asText(d.so_ban_ghi_giai_ma)}</strong></Field>
                 )}
+                {d.so_ban_ghi_moi !== undefined && (
+                  <Field label="Trong đó là bản ghi mồi"><strong className="text-danger">{asText(d.so_ban_ghi_moi)}</strong></Field>
+                )}
                 {d.bang && (
                   <Field label="Bảng">
                     <span className="table-list">
@@ -147,6 +179,7 @@ export default function AlertDrawer({ alert, onClose }) {
                   ))
                 ) : (
                   <>
+                    {d.ly_do !== undefined && <Field label="Lý do">{IDENTITY_REASONS[d.ly_do] ?? asText(d.ly_do)}</Field>}
                     <Field label="session_id" mono>{asText(d.session_id)}</Field>
                     <Field label="pid" mono>{asText(d.pid)}</Field>
                   </>

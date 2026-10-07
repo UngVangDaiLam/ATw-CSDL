@@ -40,9 +40,55 @@
 //    > 1 la cau long nhau ben trong. Cac dong long nhau khong bi vut di ma
 //    duoc DEM: so lan goi pgp_sym_decrypt trong mot cau lenh chinh la so ban
 //    ghi da bi giai ma - chinh xac thu ma rule BULK_DECRYPT can.
+//
+//    Tuong tu, dong long nhau chua dau moc day bay (config.honeytokenMarker -
+//    than ham audit.honeytoken_tripped) nghia la app.decrypt_text() vua giai
+//    ma trung MOT ban ghi moi (05_crypto.sql). Chi xet dong LONG NHAU: than
+//    ham do db_owner viet. Ke tan cong viet dau moc vao cau SQL cua minh thi no
+//    nam o substatement 1, khong duoc dem.
+//
+//    KHONG dua vao object_name cho viec nay: pgAudit tu giau cau long nhau co
+//    cham bang ben trong ham SECURITY DEFINER khi session user (app_user)
+//    khong phai thanh vien cua chu ham - dau moc phai nam o cau KHONG cham bang
+//    moi con hien trong log (xem BAY 1 o 05_crypto.sql).
 // ---------------------------------------------------------------------------
 
 const { parseAuditMessage, extractRoleChange } = require('./auditLine');
+const config = require('./config');
+
+// ---------------------------------------------------------------------------
+// VAN DE 3 - Vai da SET ROLE chua chac la nguoi do
+//
+// app_user la thanh vien cua moi role nv_*, nen "SET ROLE nv_dn01" trong log
+// KHONG chung minh nv_dn01 dang lam viec. RLS (postgres/init/06_rls.sql) doi
+// them token phien dang nhap cua chinh nv_dn01; thieu thi
+// app.current_branch_id() ghi mot dong LOG
+// "SECDB_IDENTITY_WITHOUT_SESSION role=<current_user> ly_do=...".
+//
+// Gap dong do voi ly do MAO DANH (IMPERSONATION_REASONS) thi vai cua phien la
+// VAI MAO DANH: canh bao cua cac cau lenh trong khoang vai do quy cho session
+// user (app_user - danh tinh da xac thuc that), khong quy cho nv_dn01 - nhan
+// vien bi mao danh khong lam gi ca. Ten vai van nam trong detail. Token het han
+// hay nhan vien bi khoa thi KHONG: nguoi dung van rat co the la chinh nhan vien
+// do, canh bao van quy cho ho.
+//
+// Ba dieu kien de tin mot dong LOG nhu vay:
+//   1. context bat dau bang "PL/pgSQL function current_branch_id() " - mot
+//      khoi DO tu RAISE LOG cung noi dung mang context "inline_code_block".
+//      Ham trung ten trong pg_temp khong tao duoc: PUBLIC khong co quyen TEMP
+//      (04_grants.sql).
+//   2. role trong dong LOG == vai ma analyzer dang thay phien do mang. Ham do
+//      lay current_user nen hai gia tri luon khop; lech nhau nghia la dong LOG
+//      khong noi ve vai nay - bo qua, KHONG duoc dung no doi nguoi chiu trach
+//      nhiem. (Truoc day ham ghi LOG nhan ten role qua tham so - ai cung goi
+//      duoc voi ten bat ky va day trach nhiem cua chinh minh sang app_user.)
+//   3. Chi app.current_branch_id() ghi dong nay, khong ham nao nhan ten role
+//      tu ben ngoai (06_rls.sql).
+// ---------------------------------------------------------------------------
+const IDENTITY_PREFIX = 'SECDB_IDENTITY_WITHOUT_SESSION ';
+const IDENTITY_RE = /^SECDB_IDENTITY_WITHOUT_SESSION role=([a-z][a-z0-9_]*) ly_do=([a-z_]+)$/;
+const IDENTITY_CONTEXT = 'PL/pgSQL function current_branch_id() ';
+const IMPERSONATION_REASONS = new Set(['khong_co_token', 'token_khong_ton_tai', 'token_cua_nguoi_khac']);
 
 const DECRYPT_RE = /pgp_sym_decrypt/i;
 const ENCRYPT_RE = /pgp_sym_encrypt/i;
@@ -72,6 +118,7 @@ class SessionTracker {
         remoteHost: null,
         appName: null,
         role: null,        // vai hien tai do SET ROLE dat ra
+        unverifiedRole: null, // vai bi phat hien dang mang ma khong co phien (VAN DE 3)
         pending: null,     // nhom cau lenh dang gom do
       };
       this.sessions.set(sessionId, session);
@@ -90,6 +137,33 @@ class SessionTracker {
 
     const message = record.message || '';
 
+    // Mang vai nhan vien ma khong co token phien (VAN DE 3). Dong nay sinh ra
+    // TRONG LUC cau lenh chay, sau cac dong AUDIT cua no, nen gan vao cau dang
+    // gom - khong flush, khong tach cau lenh lam doi.
+    if (record.error_severity === 'LOG' && message.startsWith(IDENTITY_PREFIX)) {
+      const m = IDENTITY_RE.exec(message);
+      if (!m || !String(record.context || '').startsWith(IDENTITY_CONTEXT)) return;
+      if (m[1] !== session.role) return;     // dieu kien 2, xem VAN DE 3
+      const identity = { role: m[1], reason: m[2] };
+      if (IMPERSONATION_REASONS.has(m[2])) session.unverifiedRole = m[1];
+      if (session.pending) {
+        if (!session.pending.identity) session.pending.identity = identity;
+      } else {
+        const unverified = this.isUnverified(session, session.role);
+        this.onStatement({
+          ...this.baseEvent(session, record.timestamp),
+          actor: unverified ? session.sessionUser : session.role,
+          unverifiedRole: unverified ? session.role : null,
+          class: 'IDENTITY',
+          command: '',
+          statement: '',
+          relations: [],
+          identity,
+        });
+      }
+      return;
+    }
+
     // Phien dong -> xa not cau lenh cuoi roi quen phien di, tranh phinh bo nho
     // khi doc file log lon.
     if (message.startsWith('disconnection:')) {
@@ -106,23 +180,17 @@ class SessionTracker {
     // lay tu phien nhu moi cau lenh khac, nen quy duoc cho dung nv_xxx.
     if (record.error_severity === 'ERROR' && record.state_code === '42501') {
       this.flushSession(session);
+      const unverified = this.isUnverified(session, session.role);
       this.onStatement({
-        sessionId: session.sessionId,
-        pid: session.pid,
-        sessionUser: session.sessionUser,
-        database: session.database,
-        remoteHost: session.remoteHost,
-        appName: session.appName,
-        actor: session.role || session.sessionUser,
+        ...this.baseEvent(session, record.timestamp),
+        actor: unverified ? session.sessionUser : (session.role || session.sessionUser),
+        unverifiedRole: unverified ? session.role : null,
         roleWasSet: Boolean(session.role),
-        timestamp: record.timestamp,
         statementId: null,
         class: 'DENIED',
         command: record.ps || '',
         statement: record.statement || '',
         relations: [],
-        decryptedRows: 0,
-        encryptedRows: 0,
         deniedMessage: record.message || '',
       });
       return;
@@ -140,9 +208,11 @@ class SessionTracker {
         // chinh cau "SET ROLE nv_x" van duoc quy cho vai cu (app_user), con
         // cac cau sau moi thuoc ve nv_x.
         role: session.role,
+        identity: null,
         relations: new Set(),
         decryptedRows: 0,
         encryptedRows: 0,
+        honeytokenHits: 0,
         head: null,
         timestamp: record.timestamp,
         startFile: pos?.file,
@@ -174,12 +244,17 @@ class SessionTracker {
       // RESET ROLE sau moi COMMIT/ROLLBACK de de lai dau moc trong log.
       if (audit.class === 'MISC' && (audit.command === 'SET' || audit.command === 'RESET')) {
         const change = extractRoleChange(audit.statement);
-        if (change !== undefined) session.role = change;
+        if (change !== undefined) {
+          session.role = change;
+          // Doi vai la bat dau mot khoang moi - phai chung minh lai.
+          session.unverifiedRole = null;
+        }
       }
     } else {
       // Cau long nhau: khong phai hanh dong client, nhung dem duoc.
       if (DECRYPT_RE.test(audit.statement)) pending.decryptedRows += 1;
       else if (ENCRYPT_RE.test(audit.statement)) pending.encryptedRows += 1;
+      if (audit.statement.includes(config.honeytokenMarker)) pending.honeytokenHits += 1;
     }
   }
 
@@ -188,17 +263,15 @@ class SessionTracker {
     session.pending = null;
     if (!pending || !pending.head) return;
 
+    // Ai chiu trach nhiem: vai da SET ROLE, khong co thi la chinh session user.
+    // Ngoai le: vai mao danh (VAN DE 3) -> session user, ten vai vao detail.
+    const unverified = this.isUnverified(session, pending.role);
     this.onStatement({
-      sessionId: session.sessionId,
-      pid: session.pid,
-      sessionUser: session.sessionUser,
-      database: session.database,
-      remoteHost: session.remoteHost,
-      appName: session.appName,
-      // Ai chiu trach nhiem: vai da SET ROLE, khong co thi la chinh session user.
-      actor: pending.role || session.sessionUser,
+      ...this.baseEvent(session, pending.timestamp),
+      actor: unverified ? session.sessionUser : (pending.role || session.sessionUser),
+      unverifiedRole: unverified ? pending.role : null,
+      identity: pending.identity,
       roleWasSet: Boolean(pending.role),
-      timestamp: pending.timestamp,
       statementId: pending.statementId,
       class: pending.head.class,
       command: pending.head.command,
@@ -206,7 +279,29 @@ class SessionTracker {
       relations: Array.from(pending.relations),
       decryptedRows: pending.decryptedRows,
       encryptedRows: pending.encryptedRows,
+      honeytokenHits: pending.honeytokenHits,
     });
+  }
+
+  // Vai `role` cua phien da bi chung minh la vai mao danh (VAN DE 3). Mot nguon
+  // duy nhat: session.unverifiedRole, xoa moi lan doi vai.
+  isUnverified(session, role) {
+    return Boolean(role) && role === session.unverifiedRole;
+  }
+
+  baseEvent(session, timestamp) {
+    return {
+      sessionId: session.sessionId,
+      pid: session.pid,
+      sessionUser: session.sessionUser,
+      database: session.database,
+      remoteHost: session.remoteHost,
+      appName: session.appName,
+      timestamp,
+      decryptedRows: 0,
+      encryptedRows: 0,
+      honeytokenHits: 0,
+    };
   }
 
   // Goi khi het file: cac phien chua thay dong disconnection van con cau lenh

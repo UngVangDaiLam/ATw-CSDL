@@ -4,6 +4,16 @@
 // 70–95 theo số bản ghi, lấy mức trần) — dùng để tô màu khi chỉ có mã rule.
 
 export const RULES = {
+  HONEYTOKEN_ACCESS: {
+    score: 98,
+    label: 'Chạm bản ghi mồi',
+    hint: 'Giải mã CCCD của khách hàng mồi (honeytoken) — không ai có lý do hợp lệ để mở; bắt được cả khi chỉ một dòng và dù quyền hợp lệ',
+  },
+  IDENTITY_WITHOUT_SESSION: {
+    score: 95,
+    label: 'Mạo danh nhân viên',
+    hint: 'SET ROLE sang vai nhân viên nhưng không có token phiên đăng nhập của người đó — RLS trả 0 dòng (50 nếu chỉ là token hết hạn)',
+  },
   SQLI_UNION: {
     score: 90,
     label: 'SQL Injection · UNION',

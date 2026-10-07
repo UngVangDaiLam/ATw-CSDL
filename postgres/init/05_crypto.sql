@@ -101,6 +101,9 @@ GRANT EXECUTE ON FUNCTION ext.index_pepper() TO db_owner;
 -- db_owner, mà db_owner đang bị FORCE ROW LEVEL SECURITY chặn nên luôn đọc ra
 -- 0 dòng và hàm luôn trả NULL. Nhận ciphertext vào thì câu SELECT nằm ở phía
 -- người gọi, RLS áp đúng theo chi nhánh của họ.
+-- (Ngoại lệ duy nhất: app.decrypt_text() tra audit.honeytokens qua hàm phụ
+-- audit.is_honeytoken() - bảng đó KHÔNG bật RLS và thuộc db_owner, nên lần tra
+-- chạy đúng dưới SECURITY DEFINER.)
 -- =============================================================================
 
 -- db_owner cần chạm được vào pgcrypto để định nghĩa và chạy ba hàm bọc bên
@@ -111,6 +114,7 @@ GRANT EXECUTE ON FUNCTION ext.pgp_sym_encrypt(text, text, text) TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.pgp_sym_decrypt(bytea, text)      TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.hmac(text, text, text)            TO db_owner;
 GRANT EXECUTE ON FUNCTION ext.crypt(text, text)                 TO db_owner;   -- PHẦN 4
+GRANT EXECUTE ON FUNCTION ext.gen_random_bytes(integer)         TO db_owner;   -- PHẦN 4, token phiên
 
 SET ROLE db_owner;
 
@@ -144,6 +148,66 @@ AS $$
     END;
 $$;
 
+-- -----------------------------------------------------------------------------
+-- Giải mã, kèm phát hiện bản ghi mồi (honeytoken - 03_schema.sql).
+--
+-- Mỗi lần giải mã tra SHA-256 của ciphertext trong audit.honeytokens (một lần
+-- dò khóa chính). Trúng mồi thì kết quả đi qua audit.honeytoken_tripped() -
+-- hàm đó trả nguyên plaintext, nhưng thân hàm của nó là một câu lệnh có tên
+-- riêng trong log pgAudit. Người gọi nhận đúng plaintext như mọi dòng khác:
+-- không lỗi, không trễ đáng kể - không biết mình vừa chạm bẫy.
+--
+-- Vì sao đặt ở ĐÂY mà không ở tầng ứng dụng: mọi đường giải mã đều bắt buộc
+-- đi qua hàm này (không role nghiệp vụ nào có USAGE trên `ext`), kể cả SQL
+-- Injection hay một kết nối psql thẳng bằng mật khẩu app_user bị lộ. Bẫy đặt ở
+-- app thì chỉ bắt được kẻ đi đúng đường của app.
+--
+-- BẪY 1 - pgAudit TỰ GIẤU câu lệnh lồng nhau CÓ CHẠM BẢNG bên trong hàm
+-- SECURITY DEFINER khi session user (app_user) không phải thành viên của chủ
+-- hàm (db_owner) - cố ý, để không lộ nội dung hàm. Câu KHÔNG chạm bảng thì vẫn
+-- được ghi. Vì vậy:
+--   - phần tra audit.honeytokens nằm trong hàm riêng audit.is_honeytoken()
+--     -> bị giấu, đúng điều mong muốn (không thêm dòng log nào mỗi lần giải mã);
+--   - thân app.decrypt_text() và audit.honeytoken_tripped() KHÔNG được chạm
+--     bảng nào. Viết EXISTS (SELECT ... FROM audit.honeytokens) thẳng vào thân
+--     decrypt_text là dòng log giải mã biến mất khỏi mọi phiên của app -
+--     BULK_DECRYPT và HONEYTOKEN_ACCESS cùng mù (đã xảy ra). Phiên superuser
+--     qua socket thì vẫn thấy dòng đó, nên thử bằng psql -U postgres sẽ tưởng
+--     là chạy đúng.
+--
+-- BẪY 2 - cả hai hàm phụ đều có mệnh đề SET để planner KHÔNG inline chúng vào
+-- câu gọi. Bị inline thì phần tra bảng chui vào thân decrypt_text (dính bẫy 1),
+-- còn thân honeytoken_tripped không còn là câu lệnh riêng để pgAudit ghi.
+--
+-- GIỮ LANGUAGE sql, ĐỪNG chuyển sang plpgsql cho "dễ viết IF". PL/pgSQL tính
+-- các biểu thức đơn giản (RETURN ext.pgp_sym_decrypt(...)) bằng đường tắt
+-- không qua executor, nên pgAudit KHÔNG ghi chúng - đã thử: bản plpgsql giải mã
+-- 3 dòng không để lại dòng lồng nhau nào.
+-- -----------------------------------------------------------------------------
+CREATE FUNCTION audit.is_honeytoken(p_cipher bytea) RETURNS boolean
+    LANGUAGE sql
+    STABLE
+    SET search_path = pg_catalog          -- chặn inline, xem BẪY 2
+AS $$
+    SELECT EXISTS (SELECT 1 FROM audit.honeytokens h
+                   WHERE h.cipher_sha256 = sha256(p_cipher))
+$$;
+
+-- Thân hàm chính là "dây bẫy": analyzer tìm chữ honeytoken_tripwire trong các
+-- dòng LỒNG NHAU (substatement > 1). Chữ đó nằm trong mã nguồn hàm do db_owner
+-- viết, không phải trong câu SQL của người gọi - câu của người gọi luôn là
+-- substatement 1. Không chạm bảng nào, xem BẪY 1.
+CREATE FUNCTION audit.honeytoken_tripped(p_plain text) RETURNS text
+    LANGUAGE sql
+    VOLATILE
+    SET search_path = pg_catalog          -- chặn inline, xem BẪY 2
+AS $$
+    SELECT p_plain AS honeytoken_tripwire
+$$;
+
+REVOKE ALL ON FUNCTION audit.is_honeytoken(bytea)      FROM PUBLIC;
+REVOKE ALL ON FUNCTION audit.honeytoken_tripped(text)  FROM PUBLIC;
+
 CREATE FUNCTION app.decrypt_text(p_cipher bytea) RETURNS text
     LANGUAGE sql
     STABLE
@@ -152,6 +216,8 @@ CREATE FUNCTION app.decrypt_text(p_cipher bytea) RETURNS text
 AS $$
     SELECT CASE
         WHEN p_cipher IS NULL THEN NULL
+        WHEN audit.is_honeytoken(p_cipher)
+            THEN audit.honeytoken_tripped(ext.pgp_sym_decrypt(p_cipher, ext.master_key()))
         ELSE ext.pgp_sym_decrypt(p_cipher, ext.master_key())
     END;
 $$;
@@ -231,6 +297,11 @@ GRANT EXECUTE ON FUNCTION app.blind_index(text)   TO app_user, staff_role;
 --    tra mật khẩu nữa. Nhờ vậy SQL Injection chạy dưới vai nhân viên cũng không
 --    mượn được hàm này làm "máy dò mật khẩu".
 --
+-- 4. Đăng nhập đúng thì cấp TOKEN PHIÊN (app.staff_sessions, 03_schema.sql).
+--    RLS chỉ cho thấy dữ liệu khi vai đang SET ROLE khớp với một token còn hạn
+--    của chính vai đó (06_rls.sql). Nên mật khẩu nhân viên - không phải quyền
+--    thành viên role của app_user - mới là thứ mở được dữ liệu chi nhánh.
+--
 -- Hạn chế còn lại (ghi vào báo cáo): ai cầm được mật khẩu của chính app_user
 -- vẫn gọi được hàm này để thử mật khẩu, vòng qua bộ đếm đăng nhập sai của tầng
 -- web (app/src/loginLimiter.js). Vẫn tốt hơn hẳn trước đây - khi đó họ lấy được
@@ -239,15 +310,18 @@ GRANT EXECUTE ON FUNCTION app.blind_index(text)   TO app_user, staff_role;
 -- =============================================================================
 SET ROLE db_owner;
 
+-- VOLATILE (không còn STABLE): đăng nhập đúng thì GHI một dòng app.staff_sessions.
 CREATE FUNCTION app.verify_staff_login(p_username text, p_password text)
-    RETURNS TABLE (id int, username text, db_user text, branch_id int, full_name text)
+    RETURNS TABLE (id int, username text, db_user text, branch_id int, full_name text,
+                   session_token text)
     LANGUAGE plpgsql
-    STABLE
+    VOLATILE
     SECURITY DEFINER
     SET search_path = ext, pg_catalog
 AS $$
 DECLARE
     v_staff app.staff%ROWTYPE;
+    v_token text;
     -- Salt bcrypt hợp lệ (22 ký tự), không ứng với mật khẩu nào - xem điểm 2.
     c_dummy CONSTANT text := '$2a$06$KhongPhaiMatKhauThat00';
 BEGIN
@@ -259,15 +333,37 @@ BEGIN
     -- NULL: phép so ra NULL, không bao giờ là true.
     IF ext.crypt(coalesce(p_password, ''), coalesce(v_staff.password_hash, c_dummy))
            = v_staff.password_hash THEN
+        -- Điểm 4: cấp token phiên (03_schema.sql, app.staff_sessions). Token
+        -- CHỈ ra khỏi database qua giá trị trả về này - bảng giữ SHA-256.
+        -- gen_random_bytes của pgcrypto là CSPRNG; random() thì KHÔNG.
+        v_token := encode(ext.gen_random_bytes(32), 'hex');
+        DELETE FROM app.staff_sessions WHERE expires_at < now();   -- dọn phiên cũ
+        INSERT INTO app.staff_sessions (token_sha256, staff_id)
+        VALUES (sha256(convert_to(v_token, 'UTF8')), v_staff.id);
+
         RETURN QUERY SELECT v_staff.id, v_staff.username, v_staff.db_user,
-                            v_staff.branch_id, v_staff.full_name;
+                            v_staff.branch_id, v_staff.full_name, v_token;
     END IF;
 END $$;
+
+-- Đăng xuất: thu hồi token ngay, không đợi hết hạn. Không token nào khớp thì
+-- không làm gì - không lộ ra token đó có từng tồn tại hay không.
+CREATE FUNCTION app.end_staff_session(p_token text) RETURNS void
+    LANGUAGE sql
+    VOLATILE
+    SECURITY DEFINER
+    SET search_path = pg_catalog
+AS $$
+    DELETE FROM app.staff_sessions WHERE token_sha256 = sha256(convert_to(p_token, 'UTF8'));
+$$;
 
 RESET ROLE;
 
 REVOKE ALL ON FUNCTION app.verify_staff_login(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app.verify_staff_login(text, text) TO app_user;
+-- Như verify_staff_login: chỉ app_user (luồng đăng xuất chạy trước/ngoài SET ROLE).
+REVOKE ALL ON FUNCTION app.end_staff_session(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.end_staff_session(text) TO app_user;
 
 -- =============================================================================
 -- GHI CHÚ CHO BƯỚC SAU

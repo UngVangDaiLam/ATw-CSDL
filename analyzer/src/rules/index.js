@@ -10,6 +10,8 @@
 // Them rule moi: tao file trong thu muc nay roi them vao mang duoi day.
 
 module.exports = [
+  require('./honeytoken'),
+  require('./identityWithoutSession'),
   require('./sqlInjection'),
   require('./staffCredentialRead'),
   require('./accessDenied'),

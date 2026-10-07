@@ -5,6 +5,7 @@
 secrets/
 *.key
 *.pem
+.claude
 
 # --- Dữ liệu vận hành: không commit, chỉ giữ cấu trúc thư mục -----------
 logs/*
@@ -27,11 +28,6 @@ dist/
 build/
 coverage/
 
-# --- Claude Code ---------------------------------------------------------
-# CLAUDE.md thì COMMIT (hướng dẫn chung cho cả nhóm).
-# settings.local.json là cấu hình riêng từng máy -> không chia sẻ.
-.claude/settings.local.json
-
 # --- IDE / OS -----------------------------------------------------------
 # Chia sẻ settings.json cho cả nhóm (nó tắt việc Python extension đọc .env),
 # nhưng không chia sẻ launch.json / tasks.json / file cá nhân khác.
@@ -51,3 +47,7 @@ analyzer/state/*
 
 # Ban build giao dien cua app/ (npm run build)
 app/public/
+
+#Thuyet trinh
+Kich_ban.pdf
+Thuyet_trinh.pptx

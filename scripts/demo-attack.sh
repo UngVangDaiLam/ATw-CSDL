@@ -242,6 +242,45 @@ info "   bi chan (SUPERUSER) deu vao log - buoc 6 se thay PRIVILEGE_ESCALATION."
 pause
 
 # -----------------------------------------------------------------------------
+step "4c. TAN CONG 4 - ke co quyen that, rut tung ho so mot"
+info "Khong SQLi, khong IDOR: hn01 dung dung endpoint hop le GET /customers/:id,"
+info "mo lan luot cac ho so cuoi danh sach - moi request giai ma DUNG 1 CCCD."
+info "BULK_DECRYPT (nguong 50 ban ghi/cau lenh) se khong bao gio thay."
+# Moc id lay bang superuser chi de dung kich ban - ke tan cong that thi do dan.
+TOP=$(docker compose exec -T postgres psql -U postgres -d "$POSTGRES_DB" -tAc 'SELECT max(id) FROM app.customers;' | tr -d '[:space:]')
+OPENED=0
+for id in $(seq "$TOP" -1 $((TOP - 14))); do
+    [ "$(http_code "$APP/customers/$id")" = "200" ] && OPENED=$((OPENED + 1))
+done
+cmd "GET /customers/$((TOP - 14)) .. /customers/$TOP"
+good "Mo duoc $OPENED ho so chi nhanh minh (chi nhanh khac -> 404 nho RLS)."
+info "Moi phan hoi deu binh thuong, co CCCD day du - ke tan cong khong biet trong"
+info "do co ban ghi MOI (honeytoken): app.decrypt_text() tu nhan ra ciphertext moi"
+info "va de lai mot dong rieng trong log pgAudit. Buoc 6 se thay HONEYTOKEN_ACCESS."
+pause
+
+# -----------------------------------------------------------------------------
+step "4d. TAN CONG 5 - mat khau app_user (tai khoan ket noi chung) bi lo"
+info "app_user phai la thanh vien MOI role nv_* de app SET LOCAL ROLE cho tung"
+info "request. Nen ai cam mat khau app_user cung SET ROLE sang chi nhanh nao cung"
+info "duoc - PostgreSQL cho phep, vi quyen thanh vien la hop le."
+cmd "psql postgresql://app_user:***@.../secdb"
+cmd "SET ROLE nv_dn01; SELECT count(*) FROM app.customers;"
+SPOOF=$(docker compose exec -T postgres psql "postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb" \
+        -tAc 'SET ROLE nv_dn01; SELECT count(*) FROM app.customers;' 2>&1 | grep -vx 'SET' | tr -d '[:space:]')
+if [ "$SPOOF" = "0" ]; then
+    good "SET ROLE thanh cong, nhung doc ra 0 dong."
+    info "RLS con doi TOKEN PHIEN dang nhap cua chinh nv_dn01 (06_rls.sql) - token"
+    info "chi cap khi nhap dung mat khau NHAN VIEN, app giu o phia server va gan vao"
+    info "tung transaction bang tham so. Mat khau app_user khong mo duoc gi."
+    info "app.branch_of() con ghi mot dong LOG ma ke tan cong khong nhin thay ->"
+    info "buoc 6 se thay IDENTITY_WITHOUT_SESSION, quy cho app_user (khong phai nv_dn01)."
+else
+    warn "THUNG: doc duoc $SPOOF dong - DB dang chay ban init cu? -> bash scripts/reset.sh"
+fi
+pause
+
+# -----------------------------------------------------------------------------
 step "5. Lop 3 - cac hanh vi tren da vao log, analyzer co bat duoc khong?"
 sleep 2
 if docker compose ps --status running --services 2>/dev/null | grep -qx analyzer; then
@@ -274,6 +313,8 @@ dash_sql -c "SELECT id, db_user, rule_triggered, risk_score,
              FROM audit.alerts
              WHERE id > ${MAX0:-0} AND rule_triggered <> 'AFTER_HOURS'
              ORDER BY risk_score DESC, id LIMIT 12;"
+good "Rut tung ho so -> HONEYTOKEN_ACCESS (98): mot lan cham moi la du, khong can nguong."
+good "Lo mat khau app_user -> IDENTITY_WITHOUT_SESSION (90): quy cho app_user tu IP la."
 good "SQLi -> SQLI_UNION + ACCESS_DENIED, quy ve dung nv_hn01 (nho SET ROLE)."
 info "Cau UNION bi chan van de lai dong ERROR 42501 trong log - analyzer doc no"
 info "nen lan tan cong that bai van bi goi ten, khong vo hinh voi lop 3."

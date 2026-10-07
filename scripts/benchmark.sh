@@ -44,8 +44,8 @@ su_sql() { docker compose exec -T -u postgres postgres psql -X -d "$POSTGRES_DB"
 #            Không truyền danh sách class qua PGOPTIONS được: PGOPTIONS tách
 #            theo dấu cách nên "read, write" vỡ làm hai tham số.
 run_bench() {
-    local out opts=""
-    [ "$2" = none ] && opts="-c pgaudit.log=none"
+    local out opts="-c secdb.staff_token=$BENCH_TOKEN"
+    [ "$2" = none ] && opts="$opts -c pgaudit.log=none"
     out=$(docker compose exec -T -u postgres -e PGOPTIONS="$opts" postgres \
           pgbench -n -c 1 -j 1 -T "$S" -f "/tmp/bench/$1" "$POSTGRES_DB" 2>&1) || {
         echo "LOI khi chay $1:" >&2; echo "$out" >&2; exit 1; }
@@ -66,6 +66,13 @@ so_sanh() {
     }'
 }
 
+# Kịch bản SET LOCAL ROLE nv_hn01 như app; RLS còn đòi token phiên đăng nhập
+# của nv_hn01 (06_rls.sql) - thiếu thì mọi kịch bản RLS đếm 0 dòng và số đo vô
+# nghĩa. Token đi qua PGOPTIONS (scripts/staff-token.sh).
+. scripts/staff-token.sh
+trap revoke_minted_tokens EXIT
+mint_staff_token BENCH_TOKEN nv_hn01 || { echo "Khong cap duoc token phien cho benchmark"; exit 1; }
+
 log_bytes() { docker compose exec -T postgres du -sb /var/log/postgresql | cut -f1; }
 
 echo "==> Chep kich ban pgbench vao container"
@@ -75,7 +82,7 @@ tar -C scripts/bench -cf - . | docker compose exec -T -u postgres postgres \
 echo "==> ANALYZE + lam nong cache"
 su_sql "ANALYZE app.customers; ANALYZE app.orders;" >/dev/null
 for f in scripts/bench/*.sql; do
-    docker compose exec -T -u postgres -e PGOPTIONS="-c pgaudit.log=none" postgres \
+    docker compose exec -T -u postgres -e PGOPTIONS="-c secdb.staff_token=$BENCH_TOKEN -c pgaudit.log=none" postgres \
         pgbench -n -t 3 -f "/tmp/bench/$(basename "$f")" "$POSTGRES_DB" >/dev/null 2>&1
 done
 

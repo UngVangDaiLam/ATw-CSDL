@@ -16,6 +16,14 @@ REVOKE ALL    ON SCHEMA app    FROM PUBLIC;
 REVOKE ALL    ON SCHEMA audit  FROM PUBLIC;
 REVOKE ALL    ON SCHEMA ext    FROM PUBLIC;
 
+-- Quyền TEMP trên database (mặc định PUBLIC có): tạo bảng/hàm trong pg_temp.
+-- Không role nào của lab cần. Thu hồi vì hàm pg_temp.current_branch_id() tự
+-- viết sẽ RAISE LOG với đúng context "PL/pgSQL function current_branch_id()"
+-- mà analyzer tin (06_rls.sql) - tức giả được cảnh báo mạo danh.
+DO $$ BEGIN
+    EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+END $$;
+
 -- -----------------------------------------------------------------------------
 -- USAGE ON SCHEMA: điều kiện cần để chạm được tới bất kỳ object nào bên trong.
 -- Không có USAGE thì dù có GRANT SELECT trên bảng cũng vẫn bị từ chối.
@@ -148,6 +156,28 @@ GRANT USAGE  ON SEQUENCE audit.alerts_id_seq TO analyzer_user;
 -- =============================================================================
 GRANT USAGE  ON SCHEMA audit TO dashboard_user;
 GRANT SELECT ON audit.alerts TO dashboard_user;
+
+-- =============================================================================
+-- app.staff_sessions  (token phiên đăng nhập - 03_schema.sql)
+--
+-- CỐ Ý KHÔNG GRANT gì cho ai, kể cả app_user và staff_role dù hai role này có
+-- USAGE trên schema `app`. Đọc được bảng này thì chưa lấy được token (chỉ có
+-- SHA-256), nhưng GHI được là tự cấp phiên cho bất kỳ nhân viên nào - đúng thứ
+-- bảng này tồn tại để chặn. Mọi thao tác đi qua hàm SECURITY DEFINER:
+-- app.verify_staff_login() (cấp), app.end_staff_session() (thu hồi),
+-- app.branch_of() (kiểm tra).
+-- =============================================================================
+
+-- =============================================================================
+-- audit.honeytokens  (bản ghi mồi - 03_schema.sql)
+--
+-- CỐ Ý KHÔNG GRANT gì cho ai. Kể cả analyzer_user và dashboard_user dù hai role
+-- này có USAGE trên schema `audit`: analyzer phát hiện mồi qua LOG (thân hàm
+-- audit.honeytoken_tripped), không cần đọc danh sách mồi. Role nào đọc được
+-- danh sách đó thì kẻ chiếm được role ấy biết phải tránh dòng nào.
+-- Chỉ db_owner (chủ sở hữu) đọc được - đúng danh tính app.decrypt_text() chạy
+-- dưới khi tra mồi.
+-- =============================================================================
 
 -- =============================================================================
 -- admin_user

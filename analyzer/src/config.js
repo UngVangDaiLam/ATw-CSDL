@@ -82,6 +82,10 @@ module.exports = {
   // Bang chua thong tin dang nhap - doc no tu mot phien nhan vien la dau hieu
   // xau (xem rules/staffCredentialRead.js).
   credentialTable: process.env.CREDENTIAL_TABLE || 'app.staff',
+  // Dau moc "day bay" cua honeytoken: nam trong than ham
+  // audit.honeytoken_tripped(), ham ma app.decrypt_text() chi goi khi giai ma
+  // trung ban ghi moi (postgres/init/05_crypto.sql). Xem rules/honeytoken.js.
+  honeytokenMarker: process.env.HONEYTOKEN_MARKER || 'honeytoken_tripwire',
 
   // Gio hanh chinh, theo log_timezone cua database (Asia/Ho_Chi_Minh).
   businessHours: {

@@ -15,7 +15,7 @@
 -- ở bất kỳ đâu trong database.
 --
 -- -----------------------------------------------------------------------------
--- CẤU TRÚC FILE: dữ liệu chia làm HAI PHẦN, và thứ tự giữa chúng là bắt buộc.
+-- CẤU TRÚC FILE: dữ liệu chia làm BA PHẦN, và thứ tự giữa chúng là bắt buộc.
 --
 --   PHẦN A - vài dòng viết tay, giá trị cố định.
 --     scripts/verify.sh ghim cứng các giá trị này (CCCD '001201000001',
@@ -29,6 +29,12 @@
 --     5 dòng thì không đo được chi phí của RLS lẫn chi phí giải mã, và rule
 --     "một truy vấn lấy về gần như toàn bộ bảng" của analyzer cũng vô nghĩa vì
 --     khi đó LIMIT 5 đã là toàn bộ bảng.
+--
+--   PHẦN C - khách hàng mồi (honeytoken), chèn SAU CÙNG. Trông y hệt PHẦN B
+--     (tên, số điện thoại, email nối tiếp dãy số), có đơn hàng như khách thật,
+--     nhưng ciphertext CCCD của họ được ghi vào audit.honeytokens. Đặt sau
+--     PHẦN B để không xê dịch id hay phân bổ đơn hàng của PHẦN B (giữ số đo
+--     hiệu năng so sánh được với các lần chạy trước).
 -- -----------------------------------------------------------------------------
 -- =============================================================================
 
@@ -38,6 +44,8 @@ SET search_path = app, audit, ext, public;
 \set n_customers 6000
 \set n_orders    10000
 \set n_payments  4000
+-- Số khách hàng mồi ở PHẦN C. Chia đều 3 chi nhánh nên nên là bội số của 3.
+\set n_honeytokens 6
 
 -- Cố định bộ sinh số ngẫu nhiên. Nhờ vậy hai lần reset.sh cho ra cùng một tập
 -- dữ liệu, nên số đo hiệu năng giữa các lần chạy so sánh được với nhau - điều
@@ -188,6 +196,56 @@ FROM (
     LIMIT :n_payments
 ) AS o;
 
+-- =============================================================================
+-- PHẦN C - khách hàng mồi (honeytoken)
+--
+-- Xem audit.honeytokens (03_schema.sql) và app.decrypt_text() (05_crypto.sql).
+-- Nhân viên làm việc bình thường mở hồ sơ từng khách hàng mình phục vụ; không
+-- ai phục vụ những người này. Giải mã CCCD của họ chỉ xảy ra khi có người quét
+-- hàng loạt, dò id, hoặc đi đường vòng (SQLi, kết nối thẳng bằng mật khẩu
+-- app_user bị lộ) - analyzer bắt bằng rule HONEYTOKEN_ACCESS.
+--
+-- Ngụy trang: tên/điện thoại/email nối tiếp đúng dãy của PHẦN B (g = n+1, n+2
+-- ...), chi nhánh theo cùng công thức 1 + (g % 3), và mỗi người có một đơn hàng
+-- - lọc "khách không có đơn" không loại được mồi ra.
+--
+-- CCCD mồi có chữ số thứ 5 là '8' (PHẦN A là '0', PHẦN B là '9') để không bao
+-- giờ đụng ràng buộc UNIQUE của cccd_hash, dù có tăng n_customers.
+-- =============================================================================
+INSERT INTO app.customers (branch_id, full_name, phone, email, cccd, cccd_hash, created_at)
+SELECT s.branch_id, s.full_name, s.phone, s.email,
+       app.encrypt_text(s.cccd_plain),
+       app.blind_index(s.cccd_plain),
+       s.created_at
+FROM (
+    SELECT 1 + (g % 3)                                    AS branch_id,
+           'Khach Hang ' || lpad(g::text, 5, '0')         AS full_name,
+           '09' || lpad(g::text, 8, '0')                  AS phone,
+           'kh' || g || '@example.local'                  AS email,
+           CASE 1 + (g % 3)
+               WHEN 1 THEN '0012' WHEN 2 THEN '0482' ELSE '0792'
+           END || '8' || lpad(g::text, 7, '0')            AS cccd_plain,
+           now() - (random() * 365) * interval '1 day'    AS created_at
+    FROM generate_series(:n_customers + 1, :n_customers + :n_honeytokens) AS g
+) AS s;
+
+-- Đăng ký mồi: băm CIPHERTEXT vừa ghi. Nhận diện dòng mồi bằng email (dãy
+-- g > n_customers) - plaintext CCCD mồi không được chép sang audit.
+INSERT INTO audit.honeytokens (cipher_sha256, label)
+SELECT sha256(c.cccd), 'customers.cccd ' || c.email
+FROM app.customers c
+WHERE c.email IN (SELECT 'kh' || g || '@example.local'
+                  FROM generate_series(:n_customers + 1, :n_customers + :n_honeytokens) AS g);
+
+INSERT INTO app.orders (customer_id, branch_id, order_no, status, total_amount, created_at)
+SELECT c.id, c.branch_id,
+       'ORD-' || lpad((:n_orders + row_number() OVER (ORDER BY c.id))::text, 7, '0'),
+       'new',
+       round((100000 + random() * 4900000)::numeric, 2),
+       c.created_at + (random() * 30) * interval '1 day'
+FROM app.customers c
+WHERE sha256(c.cccd) IN (SELECT cipher_sha256 FROM audit.honeytokens);
+
 -- Thống kê lại sau khi ghi. ANALYZE ngay tại đây chứ không đợi autovacuum:
 -- các phép đo chi phí RLS chạy ngay sau reset.sh, mà trình tối ưu dùng thống kê
 -- cũ (bảng rỗng) sẽ chọn seq scan cho mọi thứ và cho ra số liệu sai lệch.
@@ -201,7 +259,8 @@ BEGIN
     SELECT count(*) INTO c FROM app.customers;
     SELECT count(*) INTO o FROM app.orders;
     SELECT count(*) INTO p FROM app.payments;
-    RAISE NOTICE '07_seed.sql: % khach hang, % don hang, % thanh toan', c, o, p;
+    RAISE NOTICE '07_seed.sql: % khach hang (gom % moi), % don hang, % thanh toan',
+                 c, (SELECT count(*) FROM audit.honeytokens), o, p;
 END $$;
 
 -- KHÔNG chèn cảnh báo mẫu vào audit.alerts. Mọi cảnh báo phải đi qua đường

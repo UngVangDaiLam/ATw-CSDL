@@ -48,6 +48,42 @@ CREATE TABLE app.staff (
 CREATE INDEX staff_branch_id_idx ON app.staff (branch_id);
 
 -- -----------------------------------------------------------------------------
+-- Phiên đăng nhập của nhân viên - ràng buộc "vai" với "người đã đăng nhập".
+--
+-- Vấn đề: app dùng MỘT pool app_user rồi SET LOCAL ROLE nv_xxx, nên app_user
+-- phải là thành viên của mọi role nv_*. Ai chạy được SQL dưới app_user - lộ mật
+-- khẩu app_user, hay một lỗi ở tầng app - thì SET ROLE sang chi nhánh nào cũng
+-- được. Quyền thành viên là thứ PostgreSQL kiểm tra; nó không biết nhân viên đó
+-- có thật sự đang đăng nhập hay không.
+--
+-- Cách gỡ: đăng nhập đúng mật khẩu (app.verify_staff_login, 05_crypto.sql) mới
+-- cấp một token ngẫu nhiên 256 bit. App giữ token trong session phía server và
+-- gắn vào mỗi transaction (GUC secdb.staff_token, truyền bằng tham số). Policy
+-- RLS (06_rls.sql) chỉ trả chi nhánh khi token tồn tại, còn hạn, và thuộc ĐÚNG
+-- role đang SET ROLE. SET ROLE trần, hoặc mang token của người khác -> 0 dòng.
+--
+-- Chỉ lưu SHA-256 của token. Token ngẫu nhiên 256 bit nên băm thuần là đủ
+-- (khác CCCD 12 chữ số cần HMAC): lộ bảng này không suy ngược ra token được.
+--
+-- Vì sao token lưu ở server chứ không phải token tự ký (HMAC): kiểm tra chữ ký
+-- cần đọc khóa từ Docker secret trong MỖI câu lệnh (~0,6 ms, xem
+-- docs/performance.md mục 2), còn tra bảng theo khóa chính chỉ vài µs. Và đăng
+-- xuất là xóa dòng - thu hồi tức thì, điều token tự ký không làm được.
+--
+-- KHÔNG GRANT cho ai (04_grants.sql). Chỉ các hàm SECURITY DEFINER của db_owner
+-- chạm tới.
+-- -----------------------------------------------------------------------------
+CREATE TABLE app.staff_sessions (
+    token_sha256 BYTEA       PRIMARY KEY,
+    staff_id     INT         NOT NULL REFERENCES app.staff(id),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Hạn tuyệt đối: một ca làm việc. Phiên web (express-session) hết sau 30
+    -- phút không hoạt động; token này là trần cứng phía database.
+    expires_at   TIMESTAMPTZ NOT NULL DEFAULT now() + interval '12 hours'
+);
+CREATE INDEX staff_sessions_staff_id_idx ON app.staff_sessions (staff_id);
+
+-- -----------------------------------------------------------------------------
 -- Khách hàng - bảng chứa dữ liệu nhạy cảm, mục tiêu chính của lớp 2.
 --
 -- cccd BYTEA      : ciphertext của ext.pgp_sym_encrypt(), điền ở bước 2.
@@ -130,5 +166,29 @@ CREATE INDEX alerts_created_at_idx ON audit.alerts (created_at DESC);
 CREATE INDEX alerts_db_user_idx    ON audit.alerts (db_user);
 -- GIN cho JSONB: dashboard sẽ lọc theo các khóa bên trong `detail`
 CREATE INDEX alerts_detail_gin_idx ON audit.alerts USING gin (detail);
+
+-- -----------------------------------------------------------------------------
+-- LỚP 2 + 3 - Bản ghi mồi (honeytoken).
+--
+-- Vài khách hàng giả trông y hệt khách hàng thật, không nhân viên nào có lý do
+-- mở hồ sơ của họ. Ai giải mã CCCD của họ - dù chỉ một dòng, dù có quyền hợp
+-- lệ - là dấu hiệu gần như chắc chắn của dò quét hoặc rút dữ liệu.
+--
+-- Đánh dấu theo SHA-256 của CIPHERTEXT, không theo id hay plaintext:
+--   - app.decrypt_text() chỉ nhận ciphertext (xem BẪY trong 05_crypto.sql), nên
+--     đây là thứ duy nhất hàm đó có trong tay để so.
+--   - Chép ciphertext mồi sang dòng khác rồi giải mã vẫn bị bắt.
+--   - Bảng không chứa CCCD mồi ở dạng rõ, cũng không chứa id: lộ bảng này chỉ
+--     lộ "có những ciphertext nào là mồi".
+--
+-- Nằm trong `audit`, và KHÔNG cấp quyền cho bất kỳ role nào (04_grants.sql):
+-- kẻ tấn công đọc được danh sách mồi là tránh được mồi. Chỉ db_owner - chủ sở
+-- hữu, và là danh tính mà app.decrypt_text() chạy dưới - đọc được.
+-- -----------------------------------------------------------------------------
+CREATE TABLE audit.honeytokens (
+    cipher_sha256 BYTEA       PRIMARY KEY,
+    label         TEXT        NOT NULL,      -- ghi chú cho người quản trị, vd. 'customers.cccd kh6001@...'
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 RESET ROLE;

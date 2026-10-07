@@ -154,10 +154,73 @@ mã**. Đó là cách rule `BULK_DECRYPT` biết được khối lượng thật
 Ngoài ra `pgaudit.log_relation = on` khiến câu lệnh chạm 2 bảng sinh ra 2 dòng
 cùng `statement_id` — cũng phải gom lại, nếu không sẽ đếm trùng.
 
+**pgAudit tự giấu một phần câu lồng nhau.** Câu lồng nhau **có chạm bảng**
+bên trong hàm `SECURITY DEFINER` chỉ được ghi khi *session user* là thành viên
+của chủ hàm. Với phiên `app_user` thì thân `app.branch_of()` (đọc `app.staff`)
+không bao giờ xuất hiện, trong khi phiên superuser qua socket thì có — thử
+bằng `psql -U postgres` sẽ thấy log khác hẳn log của app. Câu lồng nhau
+**không** chạm bảng (thân `app.decrypt_text()`) thì luôn được ghi. Mọi dấu
+vết analyzer cần từ bên trong hàm đều phải nằm ở loại câu thứ hai.
+
+### Mạo danh vai — `IDENTITY_WITHOUT_SESSION`
+
+`app_user` là thành viên mọi `nv_*`, nên `SET ROLE nv_dn01` trong log **không**
+chứng minh nv_dn01 đang làm việc. RLS đòi thêm token phiên đăng nhập của chính
+nhân viên đó (`postgres/init/06_rls.sql`); thiếu thì `app.current_branch_id()`
+trả NULL và `RAISE LOG 'SECDB_IDENTITY_WITHOUT_SESSION role=<current_user>
+ly_do=<...>'` — dòng chỉ vào log server, người gọi không thấy.
+
+`sessions.js` gắn dòng đó vào câu lệnh đang gom (nó xuất hiện sau các dòng
+AUDIT của chính câu đó). Với ba lý do mạo danh, vai của phiên thành **vai mạo
+danh** cho tới lần đổi vai kế tiếp: mọi cảnh báo trong khoảng đó quy cho
+**session user** (`app_user`), tên vai vào `detail.vai_khong_co_phien` — không
+đổ lỗi cho nhân viên bị mạo danh.
+
+| `ly_do` | Điểm | Nghĩa | Coi là mạo danh? |
+|---|---|---|---|
+| `token_cua_nguoi_khac` | 95 | token hợp lệ nhưng của nhân viên khác | có |
+| `khong_co_token`, `token_khong_ton_tai` | 90 | không có / token đoán bừa / đã thu hồi khi đăng xuất | có |
+| `nhan_vien_bi_khoa` | 70 | nhân viên đã bị khóa vẫn dùng token cũ | không — vẫn quy cho nhân viên |
+| `token_het_han` | 50 | quá 12 giờ (app bắt đăng nhập lại trước mốc này) | không |
+
+Ba điều kiện để tin một dòng như vậy — mỗi điều có phép thử trong `verify.sh`:
+
+1. `context` bắt đầu `PL/pgSQL function current_branch_id() `. Khối `DO` tự
+   `RAISE LOG` mang `inline_code_block`; hàm trùng tên trong `pg_temp` không
+   tạo được vì PUBLIC không có quyền `TEMP`.
+2. `role` trong dòng LOG **trùng** vai analyzer đang thấy phiên mang. Lệch thì
+   bỏ — không được dùng dòng đó để đổi người chịu trách nhiệm.
+3. Hàm ghi LOG lấy `current_user`, **không nhận tên role từ ngoài**. Bản đầu
+   tiên để `app.branch_of(role, token)` — hàm ai cũng gọi được với tên role
+   tùy ý — tự ghi LOG: ai cũng sinh được cảnh báo "nv_hcm01 bị mạo danh", và
+   một nhân viên có token chèn `branch_of('nv_dn01', ...)` vào câu SQL của
+   mình là đẩy được trách nhiệm sang `app_user`.
+
+### Bản ghi mồi (honeytoken) — `HONEYTOKEN_ACCESS`
+
+Sáu khách hàng giả (2 mỗi chi nhánh, `07_seed.sql` PHẦN C) trông y hệt khách
+thật — tên, điện thoại, email nối tiếp dãy số, có đơn hàng. Ciphertext CCCD
+của họ được băm vào `audit.honeytokens`, bảng mà **không role nào ngoài
+`db_owner`** đọc được (kể cả `analyzer_user`).
+
+`app.decrypt_text()` tra mỗi ciphertext trong bảng đó; trúng thì gọi
+`audit.honeytoken_tripped()` — hàm trả nguyên plaintext nhưng thân của nó
+(`SELECT p_plain AS honeytoken_tripwire`) thành một dòng lồng nhau trong log.
+`sessions.js` đếm các dòng **lồng nhau** chứa dấu mốc đó (`HONEYTOKEN_MARKER`).
+Chỉ xét `substatement_id > 1`: kẻ tấn công viết `honeytoken_tripwire` vào câu
+SQL của mình thì nó nằm ở substatement 1 và không được đếm.
+
+Khác mọi rule còn lại: không ngưỡng, không đoán theo hình dạng câu lệnh. Rút
+**từng** hồ sơ một qua endpoint hợp lệ (mỗi request 1 bản ghi — `BULK_DECRYPT`
+không bao giờ thấy) vẫn bị bắt ngay lần chạm mồi đầu tiên. Bằng chứng nằm ở
+`demo-attack.sh` bước 4c.
+
 ## Bộ rule
 
 | Rule | Điểm | Bắt cái gì |
 |------|------|------------|
+| `IDENTITY_WITHOUT_SESSION` | 50–95 | `SET ROLE` sang vai nhân viên mà **không có token phiên** của người đó (RLS trả 0 dòng); quy cho session user — mục "Mạo danh vai" |
+| `HONEYTOKEN_ACCESS` | 98 | giải mã CCCD của **bản ghi mồi** — dù chỉ một dòng, dù quyền hợp lệ (mục "Bản ghi mồi" ở trên) |
 | `SQLI_UNION` | 90 | câu lệnh chứa `UNION ... SELECT` — dấu vết khai thác đọc sang bảng khác |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã ≥ `BULK_DECRYPT_THRESHOLD` bản ghi (điểm tăng theo khối lượng) |
 | `SQLI_TAUTOLOGY` | 85 | điều kiện luôn đúng kiểu `OR 1=1`, `OR 'a'='a'` |
@@ -310,8 +373,9 @@ Ghi rõ trong báo cáo, đừng để người chấm tự phát hiện:
 
 - **Không đo được số dòng trả về.** pgAudit ghi *câu lệnh*, không ghi số bản
   ghi. `FULL_TABLE_READ` vì vậy đo **hình dạng** câu lệnh (không có `WHERE`)
-  chứ không đo khối lượng thật. Ngoại lệ duy nhất là `BULK_DECRYPT` — đếm được
-  vì mỗi bản ghi giải mã là một lời gọi hàm có thật trong log. Muốn đo chính
+  chứ không đo khối lượng thật. Ngoại lệ là `BULK_DECRYPT` và
+  `HONEYTOKEN_ACCESS` — đếm được vì mỗi bản ghi giải mã là một lời gọi hàm có
+  thật trong log. Muốn đo chính
   xác hơn phải bổ sung nguồn khác (`pg_stat_statements`, hoặc ứng dụng tự ghi
   số dòng đã trả).
 - **Không bắt được IDOR.** Lỗ hổng ở `/orders/:id` sinh ra một truy vấn hợp lệ
@@ -319,6 +383,12 @@ Ghi rõ trong báo cáo, đừng để người chấm tự phát hiện:
   "xem đơn hàng của mình" với "xem đơn hàng của người khác". Chặn IDOR là việc
   của RLS, không phải của analyzer — đây chính là minh họa vì sao cần nhiều lớp
   chứ không chỉ một lớp giám sát.
+- **Bản ghi mồi chỉ bắt được kẻ giải mã.** Đọc các cột không mã hóa (tên,
+  điện thoại) của khách mồi, hay sao chép ciphertext ra ngoài để giải mã nơi
+  khác (cần khóa — đã nằm ngoài mô hình) đều không chạm bẫy. Ai đọc được
+  `audit.honeytokens` (superuser, `admin_user` qua `SET ROLE db_owner`) biết
+  mồi nằm đâu. Nhân viên thật lỡ mở hồ sơ một khách mồi cũng sinh cảnh báo —
+  chấp nhận được vì đó là người họ không phục vụ.
 - **`AFTER_HOURS` ồn.** Nó đánh dấu cả hành vi hợp lệ của người làm ngoài giờ.
   Điểm rủi ro để thấp (40) vì nó được thiết kế để **cộng dồn** với rule khác,
   không phải để dùng một mình.

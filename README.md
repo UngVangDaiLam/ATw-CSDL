@@ -36,7 +36,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 103 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 129 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -49,6 +49,8 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── logs/                   # log csv + json của PostgreSQL, nguồn cho analyzer
 ├── docs/
 │   ├── threat-model.md     # STRIDE cho app/, ranh giới tin cậy app <-> DB
+│   ├── legal-mapping.md    # đối chiếu Luật 91/2025 + NĐ 356/2025 -> cơ chế -> phép thử
+│   ├── comparison.md       # so sánh với Oracle, SQL Server, AWS RDS - giống/khác/thua
 │   ├── performance.md      # phân tích chi phí hiệu năng từng lớp (viết tay)
 │   └── benchmark-results.md # số đo thô, sinh bởi scripts/benchmark.sh
 ├── app/                    # backend Express + giao diện web - xem app/README.md
@@ -74,7 +76,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
-│       └── rules/          # 9 rule trên log PostgreSQL (2 rule tầng web ở src/appEvents.js)
+│       └── rules/          # 11 rule trên log PostgreSQL (2 rule tầng web ở src/appEvents.js)
 └── dashboard/              # React + Socket.IO, đọc audit.alerts bằng dashboard_user - xem dashboard/README.md
 ```
 
@@ -231,6 +233,7 @@ từng request:
 ```sql
 BEGIN;
 SET LOCAL ROLE nv_hn01;     -- SET LOCAL: tự hết hiệu lực khi COMMIT
+SELECT set_config('secdb.staff_token', $1, true);   -- token phiên, THAM SỐ
 SELECT * FROM app.customers;
 COMMIT;
 ```
@@ -239,24 +242,53 @@ Dùng `SET LOCAL ROLE` trong transaction chứ không phải `SET ROLE` trần: 
 connection pool, quên `RESET ROLE` là request sau mượn lại connection đó sẽ
 chạy dưới danh tính người trước.
 
+### Vai phải đi kèm phiên đăng nhập (token)
+
+`app_user` phải là thành viên của **mọi** role `nv_*` thì app mới `SET LOCAL
+ROLE` được cho từng request. Hệ quả: ai chạy được SQL dưới `app_user` — lộ mật
+khẩu `app_user`, hay một lỗi ở tầng app — đều `SET ROLE` được sang chi nhánh
+bất kỳ. PostgreSQL không chặn, vì quyền thành viên là hợp lệ. Đây là giới hạn
+quen thuộc của mô hình "một pool + `SET ROLE`".
+
+Repo gỡ giới hạn đó bằng **token phiên đăng nhập**:
+
+1. Đăng nhập đúng mật khẩu nhân viên, `app.verify_staff_login()` cấp một token
+   ngẫu nhiên 256 bit; bảng `app.staff_sessions` chỉ giữ SHA-256 của nó, hạn
+   12 giờ, không role nào được đọc/ghi trực tiếp.
+2. App giữ token trong session **phía server** và gắn vào mỗi transaction bằng
+   tham số (`set_config('secdb.staff_token', $1, true)`).
+3. Policy RLS (`app.branch_of`) chỉ trả chi nhánh khi token còn hạn **và thuộc
+   đúng role đang `SET ROLE`**. `SET ROLE` trần, mang token của người khác, hay
+   token đã thu hồi khi đăng xuất → 0 dòng.
+4. Bị từ chối như vậy thì hàm ghi một dòng `LOG` vào log server (người gọi
+   không thấy); analyzer biến nó thành `IDENTITY_WITHOUT_SESSION`, quy cho
+   **`app_user`** chứ không cho nhân viên bị mạo danh.
+
+Token lưu ở server thay cho token tự ký (HMAC) là có chủ đích: kiểm chữ ký phải
+đọc khóa từ Docker secret mỗi câu lệnh (~0,6 ms), còn tra bảng theo khóa chính
+không đo được khác biệt (`docs/performance.md` mục 6); và đăng xuất là thu hồi
+tức thì.
+
 Thử trực tiếp:
 
 ```bash
 psql "postgresql://app_user@localhost:15432/secdb"
 ```
 ```sql
-SELECT count(*) FROM app.customers;               -- 0  (chưa SET ROLE)
-SET ROLE nv_hn01;  SELECT count(*) FROM app.customers;   -- 2  (chi nhánh Hà Nội)
-SET ROLE nv_dn01;  SELECT count(*) FROM app.customers;   -- 2  (chi nhánh Đà Nẵng)
-SET ROLE nv_hn01;  INSERT INTO app.customers(branch_id, full_name) VALUES (2, 'X');
--- ERROR: new row violates row-level security policy for table "customers"
+SELECT count(*) FROM app.customers;                      -- 0  (chưa SET ROLE)
+SET ROLE nv_dn01;  SELECT count(*) FROM app.customers;   -- 0  (SET ROLE được, nhưng không có token phiên)
 ```
+
+Có token (đăng nhập qua app, hoặc `scripts/staff-token.sh` khi thử nghiệm) thì
+`nv_hn01` chỉ thấy chi nhánh 1, và `INSERT` sang chi nhánh khác bị `WITH CHECK`
+từ chối (`new row violates row-level security policy`).
 
 Ba điểm dễ hiểu sai, đều là chủ đích chứ không phải lỗi:
 
 - **`app_user` chưa `SET ROLE` đọc ra 0 dòng.** Nó không có dòng nào trong
   `app.staff` nên không thuộc chi nhánh nào. Chiếm được mật khẩu `app_user` vẫn
-  chưa lấy được dữ liệu — còn phải `SET ROLE`, mà thao tác đó bị pgAudit ghi lại.
+  chưa lấy được dữ liệu — `SET ROLE` sang nhân viên thì còn thiếu token phiên
+  của nhân viên đó (mục trên).
 - **`db_owner` cũng đọc ra 0 dòng.** Mặc định chủ sở hữu bảng bỏ qua mọi policy;
   `FORCE` bắt nó phải tuân theo, và nó không có policy nào. Tức người quản trị
   CSDL không đọc được dữ liệu khách hàng. Cần thao tác ở mức quản trị thì dùng
@@ -329,6 +361,24 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
   hàm có tên rõ ràng → xuất hiện trong log pgAudit → lớp 3 phát hiện được hành
   vi giải mã hàng loạt.
 
+### Bản ghi mồi (honeytoken) — lớp 2 báo động cho lớp 3
+
+Sáu khách hàng giả (2 mỗi chi nhánh) nằm lẫn trong `app.customers`, trông y
+hệt khách thật — kể cả có đơn hàng. SHA-256 ciphertext CCCD của họ nằm trong
+`audit.honeytokens`, bảng **không role nào ngoài `db_owner` đọc được**.
+
+`app.decrypt_text()` tự tra mỗi ciphertext; trúng mồi thì vẫn trả đúng CCCD
+(người gọi không nhận ra gì) nhưng để lại một dòng riêng trong log pgAudit.
+Analyzer biến dòng đó thành `HONEYTOKEN_ACCESS` (98 điểm).
+
+Vì sao đáng giá: mọi rule khác cần **ngưỡng** hoặc **dấu hiệu bất thường trong
+câu lệnh**. Kẻ có quyền thật mở từng hồ sơ một qua endpoint hợp lệ không để lại
+cả hai — `BULK_DECRYPT` (≥ 50 bản ghi/câu lệnh) không bao giờ thấy. Mồi bắt
+được ngay lần chạm đầu tiên, và vì bẫy nằm **trong hàm giải mã** — đường duy
+nhất tới plaintext — nên đi vòng qua SQLi hay `psql` thẳng bằng mật khẩu
+`app_user` bị lộ cũng không tránh được. Chi phí: ~4,4 µs mỗi lần giải mã
+(`docs/performance.md` mục 5).
+
 > **Đừng chạy `scripts/init-secrets.sh --force` trên database đang có dữ liệu.**
 > `pgp_sym_encrypt` gắn chặt với khóa: sinh khóa mới thì `cccd`, `card_token`
 > cũ không giải mã được nữa. Đổi khóa phải đi kèm `scripts/reset.sh`.
@@ -339,16 +389,19 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
 bash scripts/verify.sh
 ```
 
-Chạy 103 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 129 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
-ghi, `FORCE RLS` chặn cả `db_owner`, mã hóa/giải mã/blind index hoạt động đúng,
+ghi, `FORCE RLS` chặn cả `db_owner`, **`SET ROLE` không kèm token phiên đúng
+người đọc ra 0 dòng** (không token, token người khác, hết hạn, đã thu hồi; token
+không lọt vào log), mã hóa/giải mã/blind index hoạt động đúng,
 role nghiệp vụ không chạm được khóa, `readonly_user` không đọc được cột `cccd`,
 **không role nghiệp vụ nào đọc được `password_hash`** (SQLi UNION bị từ chối,
 đăng nhập vẫn chạy qua hàm, mật khẩu không rò vào log),
 **`pg_dump` không chứa CCCD hay số thẻ ở dạng rõ**, khóa không rò vào log,
 pgAudit ghi được câu lệnh và cả `SET ROLE`, analyzer bắt được giải mã hàng
-loạt, SQLi (kể cả lần bị chặn), leo thang đặc quyền (tắt RLS, `GRANT ... TO
+loạt, **giải mã dù chỉ một bản ghi mồi** (còn khách thật thì không, và không
+role nào ngoài chủ sở hữu đọc được danh sách mồi), SQLi (kể cả lần bị chặn), leo thang đặc quyền (tắt RLS, `GRANT ... TO
 PUBLIC`, hàm `SECURITY DEFINER`, thử `SUPERUSER`) và quy đúng người,
 `analyzer_user` ghi được cảnh báo
 nhưng không đọc/sửa/xóa được, `dashboard_user` đọc được cảnh báo nhưng không
@@ -358,7 +411,7 @@ replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, 
 PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
 đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 103    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 129    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -455,7 +508,7 @@ cd app && npm install && cp .env.example .env && npm run dev
 ## 7b. `analyzer/` — lớp 3
 
 Đọc `logs/*.json`, bám `session_id` để quy trách nhiệm cho đúng nhân viên theo
-`SET ROLE`, áp 9 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
+`SET ROLE`, áp 11 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
 `analyzer_user` (chỉ `INSERT`).
 
 Chạy sẵn trong Docker ở chế độ `--watch` (service `analyzer`): mọi hành vi
@@ -569,7 +622,9 @@ tầng database vẫn giữ — bài thực nghiệm trung tâm cho luận đi�
 | 3b | SQLi UNION đọc `app.customers` chi nhánh khác | RLS (FORCE) + mã hóa cột | Chỉ kéo được chi nhánh mình; `cccd` là ciphertext `\x…` |
 | 4 | IDOR `/orders/:id` chi nhánh khác | RLS `branch_isolation` | `404` dù code không kiểm tra quyền |
 | 4b | `admin_user` bị chiếm: `SET ROLE db_owner`, tắt RLS, `GRANT ... TO PUBLIC`, hàm `SECURITY DEFINER`, thử `SUPERUSER` | Lớp 1 **không** chặn (chủ sở hữu có quyền) — trừ `SUPERUSER` bị từ chối | Chỉ lớp 3 thấy: `PRIVILEGE_ESCALATION`. Chạy trong transaction rồi `ROLLBACK`. |
-| 5–6 | (log các hành vi trên) | pgAudit + analyzer | `SQLI_UNION`, `ACCESS_DENIED` (lần thử bị chặn), `PRIVILEGE_ESCALATION`… quy về đúng người |
+| 4c | Kẻ có quyền thật mở lần lượt 15 hồ sơ cuối danh sách qua `GET /customers/:id` hợp lệ — mỗi request giải mã 1 CCCD | Không lớp nào chặn (quyền hợp lệ); `BULK_DECRYPT` không thấy (dưới ngưỡng) | Chạm 2 bản ghi mồi → `HONEYTOKEN_ACCESS` (98), quy cho `nv_hn01` |
+| 4d | Mật khẩu `app_user` bị lộ: kết nối thẳng, `SET ROLE nv_dn01` | Token phiên (RLS đòi token của đúng nhân viên) | `SET ROLE` được nhưng đọc ra **0 dòng** → `IDENTITY_WITHOUT_SESSION` (90), quy cho `app_user` |
+| 5–6 | (log các hành vi trên) | pgAudit + analyzer | `HONEYTOKEN_ACCESS`, `IDENTITY_WITHOUT_SESSION`, `SQLI_UNION`, `ACCESS_DENIED` (lần thử bị chặn), `PRIVILEGE_ESCALATION`… quy về đúng người |
 
 Script tự khởi động `app/` nếu chưa chạy (và tự tắt khi xong), chạy analyzer,
 rồi đọc cảnh báo bằng `dashboard_user`. Mở `dashboard/` song song để xem cảnh
@@ -582,6 +637,13 @@ Những điểm dưới đây là giới hạn **đã biết và có chủ đíc
 lỗi bị bỏ sót.
 
 **Chưa làm — hướng phát triển:**
+
+- **Xóa dữ liệu theo yêu cầu chủ thể** (Luật Bảo vệ dữ liệu cá nhân 91/2025,
+  Điều 14). `app_user` cố ý không có `DELETE`, và bản sao lưu vẫn giữ dữ liệu
+  cũ. Hướng làm: hàm xóa có kiểm soát + crypto-shredding (mỗi khách một khóa
+  con). Toàn bộ đối chiếu pháp lý, kể cả các chỗ chưa đáp ứng:
+  [`docs/legal-mapping.md`](docs/legal-mapping.md). So sánh với Oracle /
+  SQL Server / AWS: [`docs/comparison.md`](docs/comparison.md).
 
 - **Mã hóa đường truyền (TLS).** Mã hóa ở lớp 2 bảo vệ dữ liệu khi lưu trữ;
   sau khi `app.decrypt_text()` giải mã, CCCD đi dạng rõ từ database về app. Lab
@@ -602,7 +664,11 @@ lỗi bị bỏ sót.
 - Không bắt được IDOR — câu lệnh hợp lệ về cú pháp, chỉ khác giá trị `id`.
   RLS mới là thứ chặn nó.
 - pgAudit ghi câu lệnh, không ghi số dòng trả về; `FULL_TABLE_READ` đoán theo
-  hình dạng câu lệnh. Riêng `BULK_DECRYPT` đếm được số bản ghi thật.
+  hình dạng câu lệnh. Riêng `BULK_DECRYPT` và `HONEYTOKEN_ACCESS` đếm được số
+  bản ghi giải mã thật.
+- Bản ghi mồi chỉ bắt được kẻ **giải mã**: đọc tên, số điện thoại của khách
+  mồi không chạm bẫy. Ai đọc được `audit.honeytokens` (superuser, `admin_user`
+  qua `SET ROLE db_owner`) biết mồi nằm đâu.
 - pgAudit không ghi `COMMIT`/`ROLLBACK`: phải `RESET ROLE` sau mỗi transaction
   (app đã làm) thì việc quy trách nhiệm mới đúng.
 - Phiên superuser qua unix socket trong container bị bỏ qua — ai có shell
@@ -613,6 +679,11 @@ lỗi bị bỏ sót.
 - SQLi ở `/customers/search` vẫn đọc được các cột không nhạy cảm của
   `app.staff` (`username`, `db_user`). Phân quyền và RLS không thay thế được
   parameterized query.
+- Token phiên nằm trong GUC của transaction, nên SQL Injection trong một request
+  đọc được bằng `current_setting()` — nhưng đó là token của **chính người gửi
+  request**, không thêm quyền gì. Token có hạn tuyệt đối 12 giờ (không gia hạn
+  theo hoạt động); session web lưu trong bộ nhớ của app nên app khởi động lại là
+  mọi người phải đăng nhập lại, token cũ tự hết hạn.
 - Ai cầm mật khẩu của chính `app_user` gọi được `app.verify_staff_login()` để
   thử mật khẩu, vòng qua bộ đếm đăng nhập sai của tầng web — nhưng không lấy
   được hash để dò ngoại tuyến, và mỗi lần thử tốn một lần bcrypt.

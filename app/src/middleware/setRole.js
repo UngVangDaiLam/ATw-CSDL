@@ -21,6 +21,15 @@
 // session phia server, khong phai gia tri client tu dien gui len. Van kiem
 // tra lai bang whitelist regex o day nhu mot lop phong ve sau cung.
 //
+// TOKEN PHIEN: SET LOCAL ROLE thoi la CHUA DU de thay du lieu. app_user la
+// thanh vien cua moi role nv_*, nen RLS con doi token phien dang nhap cua
+// chinh nhan vien do (postgres/init/06_rls.sql, app.branch_of). Token do
+// app.verify_staff_login() cap luc dang nhap (routes/auth.js), luu trong
+// session PHIA SERVER (req.session.dbToken) - KHONG nam trong req.session.staff
+// vi doi tuong do duoc tra ve client o /auth/me.
+// Token PHAI di qua tham so $1 cua set_config(): noi chuoi vao cau SQL la no
+// nam nguyen van trong log pgAudit (log_parameter = off chi che tham so).
+//
 // Middleware nay PHAI dat SAU requireAuth trong chuoi middleware (can
 // req.session.staff.db_user da duoc dang nhap set san).
 const pool = require('../db');
@@ -28,10 +37,27 @@ const { serverError } = require('../errors');
 
 const DB_USER_RE = /^[a-z][a-z0-9_]*$/;
 
+// Token phien het han cung sau 12 gio (app.staff_sessions.expires_at,
+// postgres/init/03_schema.sql), con cookie phien web thi tu gia han theo hoat
+// dong (rolling, src/app.js). Khong chan o day thi nguoi lam qua 12 gio van
+// "dang nhap" nhung moi danh sach rong (RLS tra 0 dong) va moi request ghi mot
+// canh bao IDENTITY_WITHOUT_SESSION. Dung truoc han 5 phut cho khoi lech gio.
+const DB_TOKEN_TTL_MS = (12 * 60 - 5) * 60 * 1000;
+
 async function setRoleTransaction(req, res, next) {
   const dbUser = req.session?.staff?.db_user;
   if (!dbUser || !DB_USER_RE.test(dbUser)) {
     return res.status(403).json({ status: 'error', message: 'Tai khoan khong gan voi role CSDL hop le' });
+  }
+  const dbToken = req.session.dbToken;
+  if (typeof dbToken !== 'string' || dbToken.length === 0) {
+    // Phien tao truoc khi co token phien (app vua nang cap): bat dang nhap lai.
+    return res.status(401).json({ status: 'error', message: 'Phien dang nhap khong con hop le, hay dang nhap lai' });
+  }
+  if (!(Date.now() - (req.session.loginAt || 0) < DB_TOKEN_TTL_MS)) {
+    return req.session.destroy(() => {
+      res.status(401).json({ status: 'error', message: 'Phien dang nhap da het han (12 gio), hay dang nhap lai' });
+    });
   }
 
   let client;
@@ -41,6 +67,9 @@ async function setRoleTransaction(req, res, next) {
     // Khong the dung $1 cho ten role trong SET LOCAL ROLE, xem giai thich o
     // tren. dbUser da qua whitelist regex nen an toan de noi chuoi truc tiep.
     await client.query(`SET LOCAL ROLE ${dbUser}`);
+    // is_local = true: het hieu luc o COMMIT/ROLLBACK cung voi vai, khong ri
+    // sang request khac dung lai ket noi nay.
+    await client.query("SELECT set_config('secdb.staff_token', $1, true)", [dbToken]);
     req.dbClient = client;
   } catch (err) {
     if (client) client.release();

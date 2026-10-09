@@ -8,3 +8,5 @@
 *.sql     text eol=lf
 *.conf    text eol=lf
 Dockerfile text eol=lf
+# cmd.exe đọc .bat có LF trần bị lỗi nhảy nhãn - .bat phải CRLF.
+*.bat     text eol=crlf

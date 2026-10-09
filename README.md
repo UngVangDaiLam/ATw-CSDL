@@ -41,7 +41,8 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
 │   ├── bench/              # kịch bản pgbench, mỗi cặp chỉ khác đúng một cơ chế
-│   └── reset.sh            # dựng lại lab từ số 0 (dọn cả WAL archive)
+│   ├── reset.sh            # dựng lại lab từ số 0 (dọn cả WAL archive)
+│   └── quickstart.sh       # một lệnh: tạo .env + reset + verify (bấm đúp quickstart.bat)
 ├── backup/
 │   ├── full/               # bản sao lưu đầy đủ (pg_basebackup / pg_dump)
 │   ├── wal_archive/        # đích của archive_command
@@ -81,6 +82,21 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ```
 
 ## 2. Chạy
+
+**Cách nhanh nhất** — cần Docker Desktop (đang chạy) và Git for Windows, không
+cần cài Node hay PostgreSQL:
+
+```bash
+bash scripts/quickstart.sh       # hoặc bấm đúp quickstart.bat trên Windows
+```
+
+Một lệnh: tạo `.env` với mật khẩu ngẫu nhiên (nếu chưa có), sinh khóa, dựng lab
+từ số 0, chạy `verify.sh`, rồi in địa chỉ app/dashboard và tài khoản demo. Mỗi
+lần `git pull` xong chạy lại đúng lệnh này. Dữ liệu cũ trong lab bị xóa và sinh
+lại (giống hệt nhờ `setseed`); thêm `--yes` để không hỏi, `--no-verify` để chỉ
+dựng.
+
+Các bước thủ công tương đương:
 
 ```bash
 cp .env.example .env        # PowerShell: Copy-Item .env.example .env

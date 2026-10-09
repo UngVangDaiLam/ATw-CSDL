@@ -4,12 +4,45 @@ Môi trường lab chạy local bằng Docker Compose, minh họa 4 lớp bảo 
 
 | Lớp | Nội dung | Trạng thái |
 |-----|----------|-----------|
-| 1 | Host-based access control, Role/GRANT, Row-Level Security | **Xong cả ba** |
+| 1 | Host-based access control, TLS 1.3 bắt buộc, Role/GRANT, Row-Level Security | **Xong** |
 | 2 | Mã hóa cột dữ liệu nhạy cảm bằng `pgcrypto` | **Xong** |
 | 3 | Giám sát truy cập bằng `pgAudit` + analyzer tự viết | **Xong cả hai** |
-| 4 | Sao lưu WAL + `pg_dump` + PITR | **Xong** (base backup, dump, PITR có demo + thử khôi phục tự động) |
+| 4 | Sao lưu WAL + `pg_dump` + PITR, mã hóa toàn bộ kho sao lưu | **Xong** (base backup, dump, PITR có demo + thử khôi phục tự động) |
 
 Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socket.IO
+
+Chạy thử: `bash scripts/quickstart.sh` (hoặc bấm đúp `quickstart.bat`) — một lệnh
+dựng lab và chạy 145 phép thử nghiệm thu. Chi tiết ở mục 2.
+
+---
+
+## Điểm mới
+
+Từng cơ chế riêng lẻ (RLS, `pgcrypto`, `pgAudit`, PITR, TLS) đều là kỹ thuật
+có sẵn. Cái lab làm khác là **ghép chúng sao cho lớp này báo động cho lớp
+kia**, và chứng minh mỗi khẳng định bằng một lệnh chạy ra kết quả.
+
+| # | Chỗ hở của cách làm thông thường | Lab xử lý thế nào | Xem bằng chứng ở đâu |
+|---|----------------------------------|-------------------|----------------------|
+| 1 | Ứng dụng dùng **một tài khoản CSDL chung**. Lộ mật khẩu tài khoản đó là lộ dữ liệu của mọi chi nhánh, và CSDL không biết nhân viên nào đang thao tác | Mỗi request mang vai riêng của nhân viên (`SET LOCAL ROLE nv_xxx`), và vai đó **chỉ có hiệu lực khi kèm token phiên đăng nhập của đúng người**. Cầm mật khẩu `app_user` tự `SET ROLE` sang nhân viên: đọc ra 0 dòng, và chính hành vi đó sinh cảnh báo quy cho `app_user` | `demo-attack.sh` bước 4d · `verify.sh` mục LOP 1f |
+| 2 | Log CSDL chỉ ghi tài khoản kết nối (`app_user`), nên **không quy được trách nhiệm** cho từng người | Analyzer bám theo từng phiên (`session_id`) và các lệnh `SET ROLE` / `RESET ROLE` trong log pgAudit, quy mỗi câu lệnh về đúng nhân viên | `verify.sh` mục LOP 3c: cảnh báo ghi đúng `nv_dn01`, `nv_hcm01`… |
+| 3 | Kẻ có quyền hợp lệ **rút dữ liệu từng ít một** thì lọt dưới mọi ngưỡng cảnh báo | **Bản ghi mồi đặt ngay trong hàm giải mã**: giải mã trúng một khách hàng mồi là báo động (`HONEYTOKEN_ACCESS`), không cần ngưỡng. Mỗi lần giải mã còn để lại một dòng log, nên `BULK_DECRYPT` đếm **đúng số bản ghi** bị lộ (cần cho báo cáo sự cố 72 giờ) | `demo-attack.sh` bước 4c · `verify.sh` mục LOP 3c (kèm đối chứng: khách thật không kích hoạt) |
+| 4 | Khôi phục về thời điểm trước sự cố (PITR) **quay lui luôn bảng cảnh báo**, tức là xóa bằng chứng về chính vụ tấn công | Sau khi khôi phục, analyzer đọc lại log (nằm ngoài CSDL) và **ghi bù** các cảnh báo bị quay lui | `backup/scripts/demo_pitr.sh` — bước `[6/6] Ghi bu canh bao` của `pitr_restore.sh` |
+| 5 | Kẻ chiếm được ứng dụng **xóa hoặc giả** cảnh báo | Bất đối xứng quyền: `analyzer_user` chỉ ghi (không đọc, không xóa), `dashboard_user` chỉ đọc, `app_user` không chạm được. Dashboard đọc bằng cách hỏi định kỳ chứ không `LISTEN`, nên ứng dụng không nghe lén được là mình vừa bị phát hiện | `verify.sh` mục LOP 3b, 3b' |
+
+**Phòng thủ nhiều lớp có đo đạc, không chỉ mô tả.** Ứng dụng cố ý giữ hai lỗ
+hổng (SQL Injection, IDOR) để chứng minh lớp CSDL vẫn chặn được khi code sai
+(mục 7f). Mỗi khẳng định có phép thử tự động, nhiều phép có **đối chứng**
+để chắc phép thử không đạt vì lý do vô nghĩa (ví dụ: ghi một chuỗi đánh dấu
+vào WAL, không thấy nó trong kho sao lưu đã mã hóa, giải mã thì thấy lại).
+Chi phí hiệu năng của từng lớp được đo riêng (mục 7d).
+
+**Không tính là điểm mới:** TLS, mã hóa cột, mã hóa bản sao lưu, RLS, PITR là
+những thứ một hệ thống nghiêm túc phải có. Lab làm đủ để không có lỗ hổng hiển
+nhiên, và đối chiếu với Luật Bảo vệ dữ liệu cá nhân 91/2025 + Nghị định
+356/2025 ([`docs/legal-mapping.md`](docs/legal-mapping.md)). So sánh với
+Oracle / SQL Server / AWS, kể cả những chỗ lab thua:
+[`docs/comparison.md`](docs/comparison.md). Giới hạn đã biết: mục 8.
 
 ---
 

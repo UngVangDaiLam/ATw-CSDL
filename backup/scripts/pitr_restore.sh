@@ -13,7 +13,7 @@
 #   1. flush_wal      - đẩy nốt WAL đang ghi dở ra kho archive
 #   2. chọn base backup mới nhất hoàn tất TRƯỚC thời điểm cần khôi phục
 #   3. dừng postgres
-#   4. container pitr-restore: cất data cũ vào backup/full/pre_pitr_*.tar.gz,
+#   4. container pitr-restore: cất data cũ vào backup/full/pre_pitr_*.tar.gz.gpg (đã mã hóa),
 #      giải nén base backup, kiểm tra với backup_manifest, ghi cấu hình recovery
 #   5. khởi động postgres -> tự replay WAL từ archive tới thời điểm đích -> promote
 #   6. xóa cấu hình recovery khỏi postgresql.auto.conf
@@ -109,7 +109,7 @@ for _ in $(seq 1 90); do
 done
 if [ -z "$DONE" ]; then
     echo "LOI: postgres chua ra khoi recovery sau 180s. Xem log moi nhat trong ./logs/"
-    echo "     Data truoc khi khoi phuc da cat o backup/full/pre_pitr_*.tar.gz"
+    echo "     Data truoc khi khoi phuc da cat o backup/full/pre_pitr_*.tar.gz.gpg (giai ma: backup-crypt.sh decrypt <file> - | tar xz)"
     exit 1
 fi
 

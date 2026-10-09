@@ -50,6 +50,18 @@ function resolveStateFile() {
   return DEFAULT_STATE;
 }
 
+// TLS toi database, xac thuc server bang CA cua lab (verify-full). Thieu CA thi
+// dung lai chu khong lui ve ket noi khong ma hoa. Cung cach voi app/src/db.js.
+function sslConfig() {
+  const caFile = process.env.DB_SSL_ROOT_CERT
+    || path.resolve(ROOT, '..', 'secrets', 'tls_ca.crt');
+  try {
+    return { ca: fs.readFileSync(caFile, 'utf8'), rejectUnauthorized: true };
+  } catch (err) {
+    throw new Error(`Khong doc duoc CA TLS ${caFile} (${err.code}). Chay: bash scripts/init-secrets.sh`);
+  }
+}
+
 module.exports = {
   // Ket noi bang analyzer_user - role CHI co INSERT tren audit.alerts.
   // KHONG dung app_user: bo phan tich khong co viec gi voi du lieu nghiep vu,
@@ -61,6 +73,7 @@ module.exports = {
     database: process.env.DB_NAME || 'secdb',
     user: process.env.DB_USER || 'analyzer_user',
     password: process.env.DB_PASSWORD,
+    ssl: sslConfig(),
   },
 
   // Thu muc log va file ghi nho vi tri da doc.

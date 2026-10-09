@@ -12,11 +12,11 @@
 # `down -v` xóa volume pgdata, nên cluster mới khởi tạo lại và đánh số WAL từ
 # đầu (000000010000000000000001). Nhưng ./backup/wal_archive là thư mục trên
 # host nên KHÔNG bị xóa, vẫn còn file cùng tên của cluster cũ. archive_command
-#     test ! -f /backup/wal_archive/%f && cp %p /backup/wal_archive/%f
+#     backup-crypt.sh wal-archive %p %f   (từ chối nếu file đích đã tồn tại)
 # thấy file đã tồn tại nên trả về 1 -> archiving hỏng vĩnh viễn, kẹt ở segment
 # đầu tiên, failed_count tăng không ngừng.
 #
-# Điều kiện `test ! -f` không phải thứ nên gỡ: nó chính là cái chặn việc ghi đè
+# Điều kiện "không ghi đè" đó không phải thứ nên gỡ: nó chính là cái chặn việc ghi đè
 # WAL. Nếu gỡ, archive sẽ trộn WAL của hai cluster khác nhau và mọi lần PITR
 # sau đó đều cho ra dữ liệu rác - hỏng âm thầm, nguy hiểm hơn nhiều.
 # =============================================================================

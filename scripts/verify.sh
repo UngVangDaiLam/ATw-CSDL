@@ -74,6 +74,40 @@ expect "superuser postgres bi chan qua TCP" \
 expect "superuser postgres vao duoc qua unix socket" "postgres" "$(sql_su 'SELECT current_user;')"
 
 # -----------------------------------------------------------------------------
+section "LOP 1a - TLS: ma hoa duong truyen"
+# Lop 2 chi bao ve du lieu khi LUU; sau app.decrypt_text() CCCD di dang ro tren
+# day. pg_hba bat buoc TLS (hostnossl reject), client xac thuc server bang CA
+# cua lab - ma hoa ma khong xac thuc thi ke xen giua van doc duoc.
+APP_HOSTPW="user=app_user password=${APP_USER_PASSWORD} dbname=secdb"
+expect "ket noi KHONG TLS bi tu choi du dung mat khau" "no encryption" \
+       "$(docker compose exec -T postgres psql "host=172.28.0.10 $APP_HOSTPW sslmode=disable" -tAc 'SELECT 1;' 2>&1)"
+expect_eq "ket noi mac dinh di bang TLS 1.3" "t|TLSv1.3" \
+       "$(sql_app 'SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();')"
+expect_eq "client xac thuc duoc server bang CA cua lab (verify-full)" "1" \
+       "$(docker compose exec -T postgres psql "host=172.28.0.10 $APP_HOSTPW sslmode=verify-full sslrootcert=/run/secrets/db_ca" -tAc 'SELECT 1;' 2>&1)"
+# Gia lap xen giua: client goi ten khac (vd. DNS bi dau doc tro sang dung IP
+# server). Chung chi khong mang ten do -> verify-full tu choi.
+expect "verify-full tu choi khi ten server khong khop chung chi" "does not match host name" \
+       "$(docker compose exec -T postgres psql "host=db.ke-gia-mao.local hostaddr=172.28.0.10 $APP_HOSTPW sslmode=verify-full sslrootcert=/run/secrets/db_ca" -tAc 'SELECT 1;' 2>&1)"
+# Ba client that: dung chinh cau hinh ket noi cua tung tien trinh (khong phai
+# psql), nen phep thu bat duoc ca truong hop ai do go `ssl:` khoi code.
+TLS_Q="SELECT CASE WHEN ssl THEN 't' ELSE 'f' END || '|' || coalesce(version, '') FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+expect_eq "app ket noi bang TLS 1.3 co xac thuc CA" "t|TLSv1.3" \
+       "$(docker compose exec -T app node -e "const p=require('./src/db');p.query(\"$TLS_Q\").then(r=>{console.log(Object.values(r.rows[0])[0]);return p.end()}).catch(e=>{console.log(e.message);process.exit(1)})" 2>&1)"
+expect_eq "analyzer ket noi bang TLS 1.3 co xac thuc CA" "t|TLSv1.3" \
+       "$(docker compose exec -T analyzer node -e "const {Client}=require('pg');const c=new Client(require('./src/config').db);c.connect().then(()=>c.query(\"$TLS_Q\")).then(r=>{console.log(Object.values(r.rows[0])[0]);return c.end()}).catch(e=>{console.log(e.message);process.exit(1)})" 2>&1)"
+expect_eq "dashboard ket noi bang TLS 1.3 co xac thuc CA" "t|TLSv1.3" \
+       "$(docker compose exec -T dashboard node --input-type=module -e "import pg from 'pg';import cfg from './server/config.js';const c=new pg.Client(cfg.db);try{await c.connect();const r=await c.query(\"$TLS_Q\");console.log(Object.values(r.rows[0])[0]);await c.end()}catch(e){console.log(e.message);process.exit(1)}" 2>&1)"
+expect_eq "khoa rieng TLS cua server chi postgres doc duoc (0600)" "postgres600" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres stat -c '%U%a' /etc/postgresql/tls/server.key 2>&1)"
+KEY_LEAK=""
+for s in app analyzer dashboard; do
+    docker compose exec -T "$s" sh -c 'test -e /run/secrets/pg_server_key' 2>/dev/null && KEY_LEAK="$KEY_LEAK $s"
+done
+if [ -z "$KEY_LEAK" ]; then ok "khoa rieng TLS khong mount vao container client nao"
+else bad "khoa rieng TLS khong mount vao container client nao" "khong co" "co trong:$KEY_LEAK"; fi
+
+# -----------------------------------------------------------------------------
 section "LOP 1b/1c - Role va GRANT"
 expect "app_user SELECT tren customers khong bi loi" "" "$(sql_app 'SELECT count(*) FROM app.customers;')"
 expect "app_user KHONG duoc DELETE"        "permission denied for table customers" "$(sql_app 'DELETE FROM app.customers;')"
@@ -503,8 +537,13 @@ WEB_SINCE="$(sql_su "SELECT to_char(now() AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY
 # Container tam chay thang tu image, KHONG mang (--network none): app phai dung
 # truoc khi kip noi DB. Khong dung `docker compose run app` vi no thua ke IP co
 # dinh 172.28.0.20 cua service va dung voi container app dang chay.
+# DB_SSL_ROOT_CERT tro vao bundle CA he thong co san trong image: thieu CA thi
+# app dung lai o db.js TRUOC khi toi buoc kiem khoa phien. Khong mang nen khong
+# bao gio ket noi that. MSYS_NO_PATHCONV: Git Bash doi "X=/etc/..." thanh
+# duong dan Windows.
 expect "app TU CHOI khoi dong khi SESSION_SECRET la gia tri mau" "KHONG KHOI DONG" \
-       "$(docker run --rm --network none -e SESSION_SECRET=doi_chuoi_bi_mat_nay secdb/app 2>&1)"
+       "$(MSYS_NO_PATHCONV=1 docker run --rm --network none -e SESSION_SECRET=doi_chuoi_bi_mat_nay \
+            -e DB_SSL_ROOT_CERT=/etc/ssl/certs/ca-certificates.crt secdb/app 2>&1)"
 # Trong Docker khoa la Docker secret (file), khong phai bien moi truong:
 # `docker inspect` / /proc/<pid>/environ khong doc duoc.
 expect "khoa phien KHONG nam trong bien moi truong cua container app" "0" \
@@ -692,7 +731,10 @@ section "LOP 4 - WAL archiving"
 # phép thử phía trên đã vô tình switch sang segment mới).
 # Nên: ghi một bản ghi WAL trước (pg_logical_emit_message không đụng bảng nào),
 # switch, rồi chờ ĐÚNG tên segment vừa đóng xuất hiện trong kho lưu trữ.
-WALFILE=$(sql_su "SELECT pg_logical_emit_message(true,'verify','wal-probe'); SELECT pg_walfile_name(pg_switch_wal());" | tail -1)
+# Noi dung ban ghi la mot CHUOI DANH DAU ngau nhien: WAL chua nguyen van no, nen
+# tim thay no trong kho archive = segment dang nam o dang ro tren host.
+WAL_MARKER="SECDB_WAL_MARKER_$(openssl rand -hex 6)"
+WALFILE=$(sql_su "SELECT pg_logical_emit_message(true,'verify','$WAL_MARKER'); SELECT pg_walfile_name(pg_switch_wal());" | tail -1)
 ARCHIVED=""
 for _ in $(seq 1 15); do
     [ -f "backup/wal_archive/$WALFILE" ] && { ARCHIVED="yes"; break; }
@@ -701,6 +743,15 @@ done
 if [ -n "$ARCHIVED" ]; then ok "segment $WALFILE da duoc archive sang backup/wal_archive/"
 else bad "segment WAL vua dong duoc archive" "co file $WALFILE" "khong thay sau 15s"; fi
 expect "khong co lan archive nao that bai" "0" "$(sql_su 'SELECT failed_count FROM pg_stat_archiver;')"
+# Ma hoa WAL archive (postgres/backup-crypt.sh). Phep doi chung o duoi chung
+# minh chuoi danh dau THAT SU nam trong segment do - neu khong, "khong tim thay"
+# o phep thu dau dat vi mot ly do vo nghia.
+if [ -n "$ARCHIVED" ] && ! grep -aq "$WAL_MARKER" "backup/wal_archive/$WALFILE"; then
+    ok "segment WAL trong kho archive da ma hoa (khong thay chuoi danh dau o dang ro)"
+else bad "segment WAL trong kho archive da ma hoa" "khong thay $WAL_MARKER" "thay o dang ro (hoac chua archive)"; fi
+expect "doi chung: giai ma bang khoa sao luu thi thay lai chuoi danh dau" "CO" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres bash -c \
+            "backup-crypt.sh decrypt /backup/wal_archive/$WALFILE - | grep -aq '$WAL_MARKER' && echo CO || echo KHONG" 2>&1)"
 
 # -----------------------------------------------------------------------------
 section "LOP 4b - Base backup, pg_dump va PITR"
@@ -723,11 +774,40 @@ if [ -z "$BASE" ]; then
     sleep 1
     BASE=$(pick_base "$(sql_su 'SELECT floor(extract(epoch FROM now()))::bigint;')")
 fi
-if [ -n "$BASE" ] && [ -f "backup/full/$BASE/base.tar.gz" ] && [ -f "backup/full/$BASE/backup_manifest" ]; then
-    ok "co base backup $BASE (base.tar.gz + backup_manifest)"
-else bad "co base backup" "backup/full/<ten>/base.tar.gz" "${BASE:-khong co}"; fi
-expect "ban pg_dump doc duoc, co du lieu bang customers" "TABLE DATA app customers" \
-       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres pg_restore -l "/backup/full/$BASE/secdb.dump" 2>&1)"
+if [ -n "$BASE" ] && [ -f "backup/full/$BASE/base.tar.gz.gpg" ] && [ -f "backup/full/$BASE/backup_manifest" ]; then
+    ok "co base backup $BASE (base.tar.gz.gpg + backup_manifest)"
+else bad "co base backup" "backup/full/<ten>/base.tar.gz.gpg" "${BASE:-khong co}"; fi
+expect "ban pg_dump giai ma duoc bang khoa sao luu, co du lieu bang customers" "TABLE DATA app customers" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres bash -c "backup-crypt.sh decrypt /backup/full/$BASE/secdb.dump.gpg - | pg_restore -l" 2>&1)"
+
+# Ma hoa ban sao luu (postgres/backup-crypt.sh). Ban sao luu chua ho ten, so
+# dien thoai, don hang o dang ro - lop 2 chi ma hoa cccd/card_token.
+PLAIN_BK=$(find backup/full -type f \( -name '*.tar.gz' -o -name '*.dump' -o -name '*.tar' \) 2>/dev/null | head -3)
+if [ -z "$PLAIN_BK" ]; then ok "khong co file sao luu nao o dang ro trong backup/full/"
+else bad "khong co file sao luu nao o dang ro" "chi co .gpg + manifest/info" "$PLAIN_BK"; fi
+expect "khong co khoa thi ban dump vo dung (pg_restore doc thang bi loi)" "does not appear to be a valid archive" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T postgres pg_restore -l "/backup/full/$BASE/secdb.dump.gpg" 2>&1)"
+expect "SAI khoa thi khong giai ma duoc" "Bad session key" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T -u postgres postgres bash -c \
+            'GH=$(mktemp -d); printf khoa-sai > $GH/k
+             gpg --batch --no-tty --homedir $GH --pinentry-mode loopback --passphrase-file $GH/k \
+                 --decrypt -o /dev/null '"/backup/full/$BASE/secdb.dump.gpg"'
+             gpgconf --homedir $GH --kill gpg-agent; rm -rf $GH' 2>&1)"
+# Toan ven: sua MOT byte giua file (tren ban sao trong /tmp cua container).
+# Khong co kiem tra toan ven thi ke ghi duoc vao kho sao luu cay du lieu gia ma
+# PITR van replay; voi MDC, khong co khoa thi khong tao duoc file hop le.
+expect "sua 1 byte trong ban sao luu -> giai ma phat hien va tu choi" "manipulated" \
+       "$(MSYS_NO_PATHCONV=1 docker compose exec -T -u postgres postgres bash -c \
+            'F=/tmp/tamper.gpg; cp '"/backup/full/$BASE/secdb.dump.gpg"' $F
+             N=$(( $(stat -c %s $F) / 2 )); B=$(od -An -tu1 -j $N -N 1 $F | tr -d " ")
+             printf "\\$(printf %03o $((255 - B)))" | dd of=$F bs=1 seek=$N conv=notrunc 2>/dev/null
+             backup-crypt.sh decrypt $F /dev/null; rm -f $F' 2>&1)"
+BK_LEAK=""
+for s in app analyzer dashboard; do
+    docker compose exec -T "$s" sh -c 'test -e /run/secrets/backup_key' 2>/dev/null && BK_LEAK="$BK_LEAK $s"
+done
+if [ -z "$BK_LEAK" ]; then ok "khoa sao luu khong mount vao container client nao"
+else bad "khoa sao luu khong mount vao container client nao" "khong co" "co trong:$BK_LEAK"; fi
 
 # Khôi phục THẬT sự, nhưng trong container sandbox (volume riêng, archive
 # read-only, không promote) - database đang chạy không bị đụng tới.

@@ -22,9 +22,11 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── .gitattributes          # ép LF cho .sh/.sql - bắt buộc khi làm trên Windows
 ├── postgres/
 │   ├── Dockerfile          # postgres:16 + postgresql-16-pgaudit
+│   ├── tls-entrypoint.sh   # chép khóa TLS từ Docker secret sang quyền 0600
+│   ├── backup-crypt.sh     # mã hóa base backup, pg_dump và từng segment WAL
 │   ├── conf/
-│   │   ├── postgresql.conf # pgaudit, logging, WAL archiving
-│   │   └── pg_hba.conf     # lớp kiểm soát truy cập theo host
+│   │   ├── postgresql.conf # pgaudit, logging, WAL archiving, TLS
+│   │   └── pg_hba.conf     # lớp kiểm soát truy cập theo host, bắt buộc TLS
 │   └── init/               # chạy 1 lần khi volume dữ liệu còn trống
 │       ├── 01_extensions.sql
 │       ├── 02_roles.sh
@@ -36,7 +38,7 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 129 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 145 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -44,8 +46,8 @@ Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socke
 │   ├── reset.sh            # dựng lại lab từ số 0 (dọn cả WAL archive)
 │   └── quickstart.sh       # một lệnh: tạo .env + reset + verify (bấm đúp quickstart.bat)
 ├── backup/
-│   ├── full/               # bản sao lưu đầy đủ (pg_basebackup / pg_dump)
-│   ├── wal_archive/        # đích của archive_command
+│   ├── full/               # bản sao lưu đầy đủ (pg_basebackup / pg_dump), đã mã hóa .gpg
+│   ├── wal_archive/        # đích của archive_command (từng segment đã mã hóa)
 │   └── scripts/            # full_backup.sh, pitr_restore.sh, demo_pitr.sh - xem mục 7c
 ├── logs/                   # log csv + json của PostgreSQL, nguồn cho analyzer
 ├── docs/
@@ -209,6 +211,7 @@ Khi thêm server, dùng:
 | Port | `5432` |
 | Database | `secdb` |
 | Username | `admin_user` (**không phải** `postgres`) |
+| SSL mode (tab Parameters) | để mặc định `prefer` hoặc chọn `require`. **Không** chọn `disable` — bị `pg_hba` từ chối |
 
 pgAdmin nằm trong subnet `172.28.0.0/16` nên được `pg_hba.conf` cho phép, nhưng
 chỉ với các role nghiệp vụ.
@@ -312,6 +315,34 @@ Ba điểm dễ hiểu sai, đều là chủ đích chứ không phải lỗi:
 - **`UPDATE` trúng dòng của chi nhánh khác không báo lỗi**, chỉ trả `UPDATE 0`.
   Dòng đó vô hình chứ không phải bị từ chối.
 
+### TLS — mã hóa đường truyền
+
+Lớp 2 chỉ bảo vệ dữ liệu khi **lưu**: sau `app.decrypt_text()`, CCCD đi từ
+database về app. Đoạn đường đó được bảo vệ bằng TLS 1.3:
+
+| Ở đâu | Cái gì |
+|-------|--------|
+| `pg_hba.conf` | `hostnossl all all all reject` đứng trước mọi dòng cho phép, các role nghiệp vụ dùng `hostssl`. Kết nối không mã hóa bị từ chối **dù đúng mật khẩu** (`no encryption`) |
+| `postgresql.conf` | `ssl = on`, `ssl_min_protocol_version = 'TLSv1.3'` |
+| `scripts/init-secrets.sh` | Sinh CA riêng của lab + chứng chỉ server (SAN: `172.28.0.10`, `postgres`, `localhost`, `127.0.0.1`). **Khóa CA bị xóa ngay sau khi ký**: lộ thư mục `secrets/` cũng không ký thêm được chứng chỉ giả |
+| `postgres/tls-entrypoint.sh` | Chép khóa server từ Docker secret sang `/etc/postgresql/tls/` quyền `0600` — PostgreSQL từ chối khóa mà nhóm/người khác đọc được, còn bind mount trên Windows hiện ra `0777` |
+| app / analyzer / dashboard | Tin **đúng CA của lab** (`DB_SSL_ROOT_CERT`), kiểm tên server trong chứng chỉ — tương đương `sslmode=verify-full`. Thiếu file CA thì dừng lại, không lùi về kết nối không mã hóa |
+
+Vì sao không dừng ở `sslmode=require`: `require` có mã hóa nhưng không xác thực
+server, nên kẻ xen giữa tự ký một chứng chỉ bất kỳ là đọc được hết.
+`verify.sh` có phép thử giả lập đúng tình huống này (gọi server bằng tên khác,
+bị từ chối với `does not match host name`). Log PostgreSQL ghi giao thức của
+từng kết nối: `SSL enabled (protocol=TLSv1.3, cipher=TLS_AES_256_GCM_SHA384)`.
+
+Cấp lại chứng chỉ không ảnh hưởng dữ liệu (khác với `pgcrypto_key`):
+
+```bash
+bash scripts/init-secrets.sh --force-tls && docker compose up -d --force-recreate
+```
+
+Kết nối qua unix socket (superuser trong container) không đi qua TLS. Đó là
+kênh nội bộ của container, không qua mạng.
+
 ## 4b. Lớp 2 — Mã hóa cột
 
 `customers.cccd` và `payments.card_token` là `BYTEA` chứa ciphertext của
@@ -405,7 +436,8 @@ nhất tới plaintext — nên đi vòng qua SQLi hay `psql` thẳng bằng m�
 bash scripts/verify.sh
 ```
 
-Chạy 129 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, `app_user` bị
+Chạy 145 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, **kết nối
+không TLS bị từ chối và cả ba client xác thực server bằng CA của lab**, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
 ghi, `FORCE RLS` chặn cả `db_owner`, **`SET ROLE` không kèm token phiên đúng
@@ -422,12 +454,12 @@ PUBLIC`, hàm `SECURITY DEFINER`, thử `SUPERUSER`) và quy đúng người,
 `analyzer_user` ghi được cảnh báo
 nhưng không đọc/sửa/xóa được, `dashboard_user` đọc được cảnh báo nhưng không
 ghi được kể cả khi tự mở transaction READ WRITE, dữ liệu đủ khối lượng đề bài yêu cầu và trải đều
-ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/`,
+ba chi nhánh, segment WAL vừa đóng được archive ra `backup/wal_archive/` **ở dạng mã hóa** (bản sao lưu, `pg_dump` cũng vậy; sai khóa hay sửa 1 byte đều bị từ chối),
 replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, và **một lần
 PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
 đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 129    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 145    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -474,13 +506,13 @@ PITR chỉ khôi phục được tới lần archive gần nhất. Lưu ý nó c
 **`down -v` làm hỏng WAL archiving.** Đây là cái bẫy nặng nhất của lab. `down -v`
 xóa volume `pgdata` nên cluster mới đánh số WAL lại từ
 `000000010000000000000001`, nhưng `./backup/wal_archive` nằm trên host nên vẫn
-còn nguyên file cùng tên của cluster cũ. `archive_command` có `test ! -f ...`
+còn nguyên file cùng tên của cluster cũ. `archive_command` (`backup-crypt.sh wal-archive`, không ghi đè file đã có)
 thấy file đã tồn tại, trả về 1, và **archiving chết hẳn** — kẹt ở segment đầu
 tiên, `failed_count` tăng không ngừng, trong khi server vẫn chạy bình thường
 nên không có dấu hiệu nào. Luôn dùng `bash scripts/reset.sh`, nó dọn cả
 `wal_archive`.
 
-Đừng gỡ `test ! -f` cho tiện: nó chính là cái chặn ghi đè WAL. Gỡ đi thì archive
+Đừng gỡ điều kiện "không ghi đè" đó cho tiện: nó chính là cái chặn ghi đè WAL. Gỡ đi thì archive
 trộn WAL của hai cluster khác nhau và mọi lần PITR sau đó cho ra dữ liệu rác —
 hỏng âm thầm, nguy hiểm hơn nhiều.
 
@@ -558,11 +590,54 @@ bash backup/scripts/demo_pitr.sh                                  # kịch bản
 
 | File | Việc |
 |------|------|
-| `full_backup.sh` | Tạo `backup/full/<YYYYMMDD_HHMMSS>/`: `base.tar.gz` + `pg_wal.tar.gz` + `backup_manifest` (pg_basebackup, bản vật lý — điểm xuất phát của PITR), `secdb.dump` (pg_dump -Fc, bản logic), `backup_info` (thời điểm hoàn tất). |
-| `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại vào `backup/full/pre_pitr_*.tar.gz` → giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery → analyzer ghi bù cảnh báo bị quay lui (xem dưới). Tạm dừng service `analyzer` suốt quá trình. |
+| `full_backup.sh` | Tạo `backup/full/<YYYYMMDD_HHMMSS>/`: `base.tar.gz.gpg` + `pg_wal.tar.gz.gpg` + `backup_manifest` (pg_basebackup, bản vật lý — điểm xuất phát của PITR), `secdb.dump.gpg` (pg_dump -Fc, bản logic), `backup_info` (thời điểm hoàn tất). |
+| `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại (mã hóa) vào `backup/full/pre_pitr_*.tar.gz.gpg` → giải mã và giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery → analyzer ghi bù cảnh báo bị quay lui (xem dưới). Tạm dừng service `analyzer` suốt quá trình. |
 | `demo_pitr.sh` | Ghi mốc T → `app_user` thử `DELETE` (lớp 1 chặn) → superuser xóa nhầm toàn bộ `orders`/`payments` → PITR về T → so khớp số dòng và tổng tiền. |
 | `_restore_inner.sh` | Phần chạy **bên trong** container (`pitr-restore` hoặc `pitr-sandbox` trong `docker-compose.yml`, profile `tools`). Không gọi trực tiếp. |
 | `lib.sh` | Hàm dùng chung: chọn base backup, flush WAL, đọc timeline. |
+
+### Mã hóa bản sao lưu
+
+Lớp 2 chỉ mã hóa `cccd`/`card_token`. Họ tên, số điện thoại, đơn hàng vẫn rõ
+trong bản sao lưu — và WAL archive chứa **nguyên văn mọi dòng từng được ghi**.
+Kho sao lưu lại là thứ được chép đi nơi khác, giữ lâu nhất và ít được canh nhất.
+Nên **mọi thứ chứa dữ liệu rời database đều được mã hóa** bằng
+[`postgres/backup-crypt.sh`](postgres/backup-crypt.sh) (OpenPGP đối xứng,
+AES-256, `gpg` có sẵn trong image):
+
+| Cái gì | Mã hóa ở đâu |
+|--------|--------------|
+| Từng segment WAL | `archive_command = 'backup-crypt.sh wal-archive %p %f'` — nén zlib rồi mã hóa, ghi file tạm rồi đổi tên (không bao giờ có segment dở dang mang tên thật). `restore_command` giải mã ngược lại |
+| Base backup, `pg_wal` đi kèm | `pg_basebackup` ghi vào `/tmp` **trong container**, mã hóa xong mới sang `backup/full/` |
+| `pg_dump` | Đi thẳng qua pipe `pg_dump -Fc \| backup-crypt.sh encrypt` — bản rõ không thành file ở đâu cả |
+| Bản cất `pre_pitr_*` trước khi PITR ghi đè | `tar \| backup-crypt.sh encrypt` |
+
+Chỉ `backup_manifest` (tên file + checksum) và `backup_info` (mốc thời gian) để
+rõ — không chứa dữ liệu, và script chọn base backup cần đọc chúng.
+
+- **Khóa riêng** (`secrets/backup_key`, Docker secret), không dùng chung
+  `pgcrypto_key`: lộ khóa sao lưu thì CCCD bên trong vẫn là ciphertext của lớp
+  2; lộ khóa cột thì bản sao lưu vẫn khóa. Chỉ `postgres` và hai container PITR
+  nhận khóa này.
+- **Có kiểm tra toàn vẹn (MDC)**: sửa một byte là giải mã báo `encrypted message
+  has been manipulated` và dừng khôi phục. Kẻ ghi được vào kho WAL vì vậy cũng
+  không cấy được segment giả cho PITR replay — không có khóa thì không tạo được
+  file hợp lệ. `restore_command` cố ý **không** chấp nhận segment ở dạng rõ.
+- **Mất khóa = mất mọi bản sao lưu.** Trong lab khóa nằm cạnh bản sao lưu trên
+  cùng máy; ngoài thực tế phải cất một bản ở nơi khác (két, KMS).
+- Đọc lại một bản dump bằng tay:
+  ```bash
+  docker compose exec -T postgres bash -c \
+    "backup-crypt.sh decrypt /backup/full/<ten>/secdb.dump.gpg - | pg_restore -l"
+  ```
+- Nâng cấp từ bản chưa mã hóa: chạy `bash scripts/reset.sh` (hoặc
+  `quickstart.sh`) — kho WAL và bản sao lưu cũ ở dạng rõ không dùng chung được.
+
+`verify.sh` ghi một chuỗi đánh dấu ngẫu nhiên vào WAL rồi kiểm tra: **không**
+tìm thấy nó trong segment ở kho archive, nhưng giải mã bằng khóa thì **thấy lại**
+(đối chứng — để chắc phép thử đầu không đạt vì lý do vô nghĩa). Thêm: không có
+file sao lưu rõ nào trong `backup/full/`, `pg_restore` đọc thẳng bản mã hóa bị
+lỗi, sai khóa bị từ chối, sửa 1 byte bị phát hiện, client không có khóa.
 
 Những điều cần biết:
 
@@ -661,19 +736,19 @@ lỗi bị bỏ sót.
   [`docs/legal-mapping.md`](docs/legal-mapping.md). So sánh với Oracle /
   SQL Server / AWS: [`docs/comparison.md`](docs/comparison.md).
 
-- **Mã hóa đường truyền (TLS).** Mã hóa ở lớp 2 bảo vệ dữ liệu khi lưu trữ;
-  sau khi `app.decrypt_text()` giải mã, CCCD đi dạng rõ từ database về app. Lab
-  chạy app và database trên cùng một máy, trong mạng Docker nội bộ, nên rủi ro
-  nghe lén thấp. Khi tách ra hai máy cần `ssl = on`, `hostssl` trong
-  `pg_hba.conf` và client dùng `sslmode=verify-full` — `require` có mã hóa
-  nhưng không xác thực server, vẫn bị tấn công xen giữa.
-- **Xoay khóa mã hóa.** `pgp_sym_encrypt` gắn chặt với khóa; đổi khóa phải
-  giải mã rồi mã hóa lại toàn bộ trong một transaction, giữ khóa cũ trong lúc
-  chuyển tiếp (thêm cột `key_version`). Hiện đổi khóa đồng nghĩa với
-  `scripts/reset.sh`.
-- **Mã hóa bản sao lưu.** Cột `cccd`/`card_token` trong backup đã là
-  ciphertext, nhưng họ tên, số điện thoại, đơn hàng trong `backup/full/` thì
-  chưa.
+- **Quản lý chứng chỉ TLS.** TLS đã bắt buộc (mục 4, "TLS"), nhưng CA là CA
+  tự ký của lab, cấp lại chứng chỉ bằng tay (`init-secrets.sh --force-tls`),
+  không có thu hồi (CRL/OCSP) và client chưa trình chứng chỉ của mình (mTLS).
+- **Xoay khóa mã hóa** (cả `pgcrypto_key` lẫn `backup_key`). Hiện đổi một
+  trong hai khóa đồng nghĩa với `scripts/reset.sh`. Hướng làm:
+  - Khóa cột: thêm cột `key_version`, giữ khóa cũ trong lúc chuyển tiếp, mã hóa
+    lại từng lô (`UPDATE ... SET cccd = app.encrypt_text(app.decrypt_text(cccd))`)
+    rồi mới bỏ khóa cũ. Blind index cũng phải tính lại nếu đổi pepper.
+  - Khóa sao lưu: **mã hóa phong bì** — mỗi bản sao lưu một khóa dữ liệu ngẫu
+    nhiên, khóa đó được mã hóa bằng khóa chủ. Xoay khóa chủ chỉ cần mã hóa lại
+    các khóa dữ liệu nhỏ, không đụng tới hàng GB dữ liệu; bản cũ hết hạn lưu
+    trữ thì xóa khóa dữ liệu của nó (crypto-shredding).
+  - Khóa nên nằm trong KMS/HSM thay vì file trên cùng máy chủ.
 
 **Giới hạn của lớp giám sát (chi tiết ở [`analyzer/README.md`](analyzer/README.md)):**
 

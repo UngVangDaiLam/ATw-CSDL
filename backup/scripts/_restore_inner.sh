@@ -19,12 +19,14 @@ set -euo pipefail
 MODE="${1:?thieu MODE}"; BASE="${2:?thieu ten base backup}"; TARGET="${3:?thieu thoi diem}"
 PGDATA=/var/lib/postgresql/data
 B="/backup/full/$BASE"
-RESTORE_CMD='cp /backup/wal_archive/%f %p'
+# Segment trong kho đã mã hóa (archive_command) - giải mã khi lấy ra. Sai khóa
+# hay segment bị sửa thì gpg báo lỗi, recovery dừng thay vì replay WAL giả.
+RESTORE_CMD='/usr/local/bin/backup-crypt.sh wal-restore %f %p'
 
 die() { echo "LOI: $*" >&2; exit 1; }
 
-[ -f "$B/base.tar.gz" ]    || die "khong thay $B/base.tar.gz"
-[ -f "$B/pg_wal.tar.gz" ]  || die "khong thay $B/pg_wal.tar.gz"
+[ -f "$B/base.tar.gz.gpg" ]   || die "khong thay $B/base.tar.gz.gpg (ban sao luu cu chua ma hoa? tao ban moi bang full_backup.sh)"
+[ -f "$B/pg_wal.tar.gz.gpg" ] || die "khong thay $B/pg_wal.tar.gz.gpg"
 [ -f "$B/backup_manifest" ] || die "khong thay $B/backup_manifest"
 
 if [ "$MODE" = live ]; then
@@ -34,15 +36,19 @@ if [ "$MODE" = live ]; then
     # Lưới an toàn: cất data directory hiện tại trước khi xóa. Chọn nhầm thời
     # điểm khôi phục thì vẫn còn đường quay lại. Bỏ pg_wal vì WAL đã nằm
     # trong kho archive.
-    SAVE="/backup/full/pre_pitr_$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d_%H%M%S).tar.gz"
-    echo "--> Cat data directory hien tai vao $SAVE"
-    tar czf "$SAVE" --exclude=./pg_wal -C "$PGDATA" .
+    # Cũng là một bản sao toàn bộ dữ liệu nằm trên host -> mã hóa như mọi bản
+    # sao lưu khác. Giải mã: backup-crypt.sh decrypt <file> - | tar xz -C <dir>
+    SAVE="/backup/full/pre_pitr_$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d_%H%M%S).tar.gz.gpg"
+    echo "--> Cat data directory hien tai (ma hoa) vao $SAVE"
+    tar cz --exclude=./pg_wal -C "$PGDATA" . | backup-crypt.sh encrypt - "$SAVE"
 fi
 
-echo "--> Xoa data directory va giai nen base backup $BASE"
+echo "--> Xoa data directory, giai ma va giai nen base backup $BASE"
 find "$PGDATA" -mindepth 1 -delete
-tar xzf "$B/base.tar.gz"   -C "$PGDATA"
-tar xzf "$B/pg_wal.tar.gz" -C "$PGDATA/pg_wal"
+# Giải mã thẳng vào tar qua pipe, không để lại bản rõ. File bị sửa thì gpg báo
+# "manipulated" và thoát khác 0 -> pipefail dừng script trước khi recovery.
+backup-crypt.sh decrypt "$B/base.tar.gz.gpg"   - | tar xz -C "$PGDATA"
+backup-crypt.sh decrypt "$B/pg_wal.tar.gz.gpg" - | tar xz -C "$PGDATA/pg_wal"
 chown -R postgres:postgres "$PGDATA"
 chmod 0700 "$PGDATA"
 
@@ -77,9 +83,11 @@ DB="${4:?thieu ten database}"; SQL="${5:?thieu cau truy van}"
 # archive_mode=off: phòng thủ thêm một lớp ngoài mount read-only - sandbox
 # không bao giờ được ghi vào kho WAL của cluster thật.
 # listen_addresses='': chỉ socket, container này vốn cũng không có mạng.
+# ssl=off: container này không đi qua tls-entrypoint.sh nên không có chứng chỉ;
+# để ssl=on của postgresql.conf là postgres tạm không khởi động được.
 echo "--> Bat postgres tam, replay WAL toi $TARGET"
 gosu postgres postgres -c config_file=/etc/postgresql/postgresql.conf \
-    -c archive_mode=off -c listen_addresses='' \
+    -c archive_mode=off -c listen_addresses='' -c ssl=off \
     -c logging_collector=off -c log_destination=stderr \
     -c restore_command="$RESTORE_CMD" \
     -c recovery_target_time="$TARGET" \

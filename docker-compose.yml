@@ -43,6 +43,15 @@ services:
     secrets:
       - pgcrypto_key
       - cccd_pepper
+      # TLS (lớp 1a). Khóa riêng của server CHỈ mount vào đây; tls-entrypoint.sh
+      # chép sang /etc/postgresql/tls với quyền 0600 trước khi postgres chạy.
+      - pg_server_crt
+      - pg_server_key
+      # CA công khai - để psql trong container thử được sslmode=verify-full.
+      - db_ca
+      # LỚP 4: khóa mã hóa bản sao lưu + WAL archive (backup-crypt.sh). Chỉ
+      # postgres và hai container PITR nhận - app/analyzer/dashboard thì không.
+      - backup_key
 
     ports:
       # KHÔNG dùng 5432 ở phía host: máy dev có thể đã cài sẵn PostgreSQL native
@@ -91,6 +100,9 @@ services:
     profiles: ["tools"]
     entrypoint: ["bash"]
     network_mode: none
+    # Giải mã base backup + mã hóa bản cất pre_pitr_*.
+    secrets:
+      - backup_key
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backup/wal_archive:/backup/wal_archive:ro
@@ -101,6 +113,8 @@ services:
     profiles: ["tools"]
     entrypoint: ["bash"]
     network_mode: none
+    secrets:
+      - backup_key
     volumes:
       - pitr_sandbox:/var/lib/postgresql/data
       - ./backup/wal_archive:/backup/wal_archive:ro
@@ -146,6 +160,8 @@ services:
       DB_NAME: ${POSTGRES_DB}
       DB_USER: app_user
       DB_PASSWORD: ${APP_USER_PASSWORD}
+      # TLS: xác thực server bằng CA của lab (verify-full). Cả ba client đều vậy.
+      DB_SSL_ROOT_CERT: /run/secrets/db_ca
       # Khoa ky cookie phien: Docker secret (file), KHONG phai bien moi truong.
       SESSION_SECRET_FILE: /run/secrets/session_secret
       PORT: 3000
@@ -154,6 +170,7 @@ services:
       APP_LOG_DIR: /var/log/app
     secrets:
       - session_secret
+      - db_ca
     volumes:
       - ./logs/app:/var/log/app
     ports:
@@ -184,10 +201,13 @@ services:
       DB_NAME: ${POSTGRES_DB}
       DB_USER: analyzer_user
       DB_PASSWORD: ${ANALYZER_PASSWORD}
+      DB_SSL_ROOT_CERT: /run/secrets/db_ca
       LOG_DIR: /logs
       # logs/app/ nam trong ./logs da mount CHI DOC o duoi.
       APP_LOG_DIR: /logs/app
       STATE_FILE: /state/analyzer-state.json
+    secrets:
+      - db_ca
     volumes:
       # Log là BẰNG CHỨNG: mount chỉ đọc, analyzer bị chiếm cũng không sửa/xóa
       # được dấu vết. verify.sh có phép thử cho việc này.
@@ -214,8 +234,11 @@ services:
       DB_NAME: ${POSTGRES_DB}
       DB_USER: dashboard_user
       DB_PASSWORD: ${DASHBOARD_PASSWORD}
+      DB_SSL_ROOT_CERT: /run/secrets/db_ca
       POLL_INTERVAL_MS: 2000
       PORT: 4000
+    secrets:
+      - db_ca
     ports:
       - "127.0.0.1:${DASHBOARD_HOST_PORT:-4000}:4000"
     depends_on:
@@ -234,6 +257,17 @@ secrets:
     file: ./secrets/cccd_pepper
   session_secret:
     file: ./secrets/session_secret
+  # TLS - cũng do init-secrets.sh sinh. CA là công khai (client dùng để xác
+  # thực server); khóa server chỉ service postgres nhận.
+  pg_server_crt:
+    file: ./secrets/tls_server.crt
+  pg_server_key:
+    file: ./secrets/tls_server.key
+  db_ca:
+    file: ./secrets/tls_ca.crt
+  # Lớp 4 - mã hóa bản sao lưu. Mất khóa này = mất mọi bản sao lưu.
+  backup_key:
+    file: ./secrets/backup_key
 
 volumes:
   pgdata:

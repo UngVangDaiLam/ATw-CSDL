@@ -19,7 +19,7 @@ lý do, và chỗ nào thua**.
 | Chống sửa nhật ký / cảnh báo | Unified Audit trail được bảo vệ | **Ledger tables** — chống giả mạo bằng mật mã (hash chain) | DAS mã hóa bằng KMS, đẩy ra ngoài | Phân quyền: `analyzer_user` chỉ `INSERT`, `dashboard_user` chỉ `SELECT` |
 | Phân tích hành vi bất thường | Sản phẩm DAM bên thứ ba (Oracle Audit Vault, IBM Guardium, Imperva, DataSunrise…) | như cột bên trái | như cột bên trái | Analyzer tự viết: 11 rule + 2 rule tầng web |
 | Bẫy / bản ghi mồi | Không có sẵn trong DB; sản phẩm deception riêng | như cột bên trái | như cột bên trái | Bẫy **trong hàm giải mã** (`HONEYTOKEN_ACCESS`) |
-| Khôi phục về thời điểm | RMAN, Flashback | Point-in-time restore | Automated backups + PITR | WAL archive + `pg_basebackup` + PITR, thử trong sandbox, ghi bù cảnh báo |
+| Khôi phục về thời điểm | RMAN, Flashback | Point-in-time restore | Automated backups + PITR | WAL archive + `pg_basebackup` + PITR, **mã hóa toàn bộ kho sao lưu** (cả từng segment WAL), thử trong sandbox, ghi bù cảnh báo |
 
 ## 2. Ba chỗ lab làm khác — và vì sao
 
@@ -79,8 +79,8 @@ trong database**, không phụ thuộc ứng dụng có ghi log hay không.
 |---|---|---|
 | Chống sửa bằng chứng | Ledger tables (SQL Server) chống giả mạo **bằng mật mã** — sửa được phát hiện được | Chỉ dựa vào phân quyền: superuser vẫn sửa được `audit.alerts`, và sửa xong không để lại dấu |
 | Phân tích hành vi | DAM thương mại: học baseline từng người dùng, hàng trăm mẫu, giao diện điều tra | 11 rule cố định ngưỡng; chưa có baseline theo từng nhân viên (hướng phát triển 3) |
-| Quản lý khóa | HSM / KMS, xoay khóa tự động, tách vai trò quản lý khóa | Một file khóa; xoay khóa = dựng lại database |
-| Mã hóa đường truyền | Hỗ trợ sẵn TLS, có tham số ép buộc mọi kết nối phải dùng TLS | Chưa có TLS (mạng Docker nội bộ) |
+| Quản lý khóa | HSM / KMS, xoay khóa tự động, mã hóa phong bì, tách vai trò quản lý khóa | Ba file khóa riêng (cột, sao lưu, TLS) trên cùng máy chủ; xoay khóa cột hay khóa sao lưu = dựng lại database |
+| Mã hóa đường truyền | TLS + chứng chỉ từ CA tin cậy, cấp lại/thu hồi tự động | Có TLS 1.3 bắt buộc và client xác thực server (verify-full), nhưng CA tự ký của lab, cấp lại chứng chỉ bằng tay, không có CRL/OCSP |
 | Quy mô | Đã chạy ở môi trường production lớn | Lab một máy, 6 000 khách hàng |
 | Hiệu năng giải mã | TDE gần như không tốn chi phí khi đọc | ~1,2–1,4 ms mỗi bản ghi giải mã (đánh đổi có chủ đích — `docs/performance.md` mục 2) |
 
@@ -91,7 +91,7 @@ trong database**, không phụ thuộc ứng dụng có ghi log hay không.
 > lớp 1 được kiểm chứng bằng token chứ không tin ứng dụng, mỗi lần giải mã ở
 > lớp 2 vừa bị đếm vừa có thể chạm bẫy cho lớp 3, và khôi phục ở lớp 4 không
 > làm mất cảnh báo về chính sự cố — mỗi điều có một phép thử chạy được
-> (`bash scripts/verify.sh`, 129 phép thử).
+> (`bash scripts/verify.sh`, 145 phép thử).
 
 ## Nguồn
 

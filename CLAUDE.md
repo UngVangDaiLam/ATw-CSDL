@@ -12,12 +12,12 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 
 | Lớp | Nội dung | Trạng thái |
 |-----|----------|-----------|
-| 1 | `pg_hba` + Role/GRANT + Row-Level Security | **Xong cả ba** |
+| 1 | `pg_hba` + TLS bắt buộc + Role/GRANT + Row-Level Security | **Xong** (TLS 1.3, client verify-full) |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
 | 3 | `pgAudit` + analyzer tự viết | **Xong** (11 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`; bản ghi mồi `HONEYTOKEN_ACCESS`) |
-| 4 | WAL archive + `pg_dump` + PITR | **Xong** (`backup/scripts/`, thử khôi phục trong sandbox) |
+| 4 | WAL archive + `pg_dump` + PITR, **mã hóa toàn bộ kho sao lưu** | **Xong** (`backup/scripts/`, `postgres/backup-crypt.sh`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (129 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (145 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -64,12 +64,12 @@ bash scripts/reset.sh
 **Đừng gõ `docker compose down -v` trần.** `down -v` xóa volume `pgdata` nên
 cluster mới đánh số WAL lại từ `000000010000000000000001`, nhưng
 `./backup/wal_archive` nằm trên host nên vẫn còn file cùng tên của cluster cũ.
-`archive_command` có `test ! -f ...` sẽ thấy file đã tồn tại, trả về 1, và
+`archive_command` (`backup-crypt.sh wal-archive`, giữ điều kiện `test ! -f` cũ) sẽ thấy file đã tồn tại, trả về 1, và
 **archiving hỏng vĩnh viễn** — kẹt ở segment đầu tiên, `failed_count` tăng
 không ngừng, trong khi server vẫn chạy bình thường nên không có dấu hiệu gì.
 `scripts/reset.sh` dọn luôn `wal_archive`, `backup/full` và `logs`.
 
-Điều kiện `test ! -f` không phải thứ nên gỡ cho tiện: nó chính là cái chặn ghi
+Điều kiện "không ghi đè" đó không phải thứ nên gỡ cho tiện: nó chính là cái chặn ghi
 đè WAL. Gỡ đi thì archive trộn WAL của hai cluster khác nhau và mọi lần PITR
 sau đó cho ra dữ liệu rác — hỏng âm thầm, nguy hiểm hơn nhiều.
 
@@ -154,6 +154,26 @@ analyzer chạy bằng user `node` (uid 1000) nên cần `group_add: ["999"]` tr
 compose. Thiếu nó: `EACCES` khi đọc log — trên Windows host thì file vẫn đọc
 được nên chạy analyzer tay không bao giờ thấy lỗi này. Đừng "sửa" bằng cách cho
 container chạy root, cũng đừng nới `log_file_mode`.
+
+**10. TLS là bắt buộc — kết nối TCP không mã hóa bị `pg_hba` từ chối.**
+`hostnossl all all all reject` đứng trước mọi dòng cho phép; thêm role mới thì
+dòng của nó phải là **`hostssl`**, không phải `host` (viết `host` cũng không
+lọt, vì dòng reject đứng trước — nhưng đọc file sẽ hiểu sai). Chứng chỉ do
+`init-secrets.sh` sinh (`secrets/tls_*`), khóa CA bị xóa sau khi ký; cấp lại bằng
+`--force-tls` rồi `docker compose up -d --force-recreate`, không cần `reset.sh`.
+- **Đừng bỏ `postgres/tls-entrypoint.sh`** (ENTRYPOINT của image) để trỏ thẳng
+  `ssl_key_file` vào `/run/secrets/`: secret trên Windows hiện ra `0777` và
+  postgres từ chối khởi động (*"private key file has group or world access"*).
+- **Container PITR không đi qua entrypoint đó** nên không có chứng chỉ —
+  `_restore_inner.sh` chạy postgres tạm với `-c ssl=off`. Đừng gỡ.
+- **Client Node phải giữ `ssl: { ca, rejectUnauthorized: true }`** (`app/src/db.js`,
+  `analyzer/src/config.js`, `dashboard/server/config.js`). Đừng "sửa lỗi kết nối"
+  bằng `rejectUnauthorized: false` hay `sslmode=require` — mã hóa mà không xác
+  thực server thì kẻ xen giữa tự ký chứng chỉ là đọc được hết. Thiếu CA thì
+  client cố ý dừng, không lùi về kết nối thường.
+- `psql` trong container dùng `sslmode=prefer` mặc định nên các lệnh cũ vẫn chạy.
+- Phép thử trong `verify.sh` gọi `docker ... /đường/dẫn` hoặc `-e X=/đường/dẫn`
+  phải có `MSYS_NO_PATHCONV=1` (cùng lý do với mục `backup/`).
 
 ## Quy ước phải giữ
 
@@ -549,6 +569,24 @@ git diff --cached --name-only | grep -E '^\.env$|^secrets/'   # phải không ra
 
 Xem mục 7c trong `README.md`. Phần dễ sai:
 
+- **Mọi thứ ra kho sao lưu đều qua `postgres/backup-crypt.sh`** (gpg AES-256,
+  khóa `secrets/backup_key`, RIÊNG với `pgcrypto_key`). Thêm loại bản sao lưu
+  mới thì mã hóa luôn, và **bản rõ không được chạm `/backup`** (bind mount ra
+  host): đi qua pipe hoặc `/tmp` trong container. `verify.sh` có phép thử tìm
+  `*.tar.gz` / `*.dump` rõ trong `backup/full/`.
+  - **`restore_command` cố ý không nhận segment rõ.** Đừng thêm "nếu không phải
+    gpg thì cp" cho tiện — đó là đường cấy WAL giả, thứ MDC đang chặn. Kho cũ
+    chưa mã hóa thì `reset.sh`.
+  - Mỗi lần gọi gpg dùng homedir tạm và **tắt `gpg-agent` khi xong** — gpg 2.x
+    luôn đi qua agent kể cả `--batch`; bỏ bước đó là mỗi segment WAL để lại một
+    tiến trình sống mãi.
+  - `wal-archive` ghi file tạm `.<tên>.tmp` rồi `mv`: postgres bị dừng giữa
+    chừng mà để file dở mang tên thật thì mọi lần PITR sau hỏng.
+  - `init-secrets.sh --force` sinh `backup_key` mới → mọi bản sao lưu và segment
+    cũ không giải mã được. Đổi khóa phải kèm `reset.sh` (xoay khóa: hướng phát triển).
+  - Container PITR cần secret `backup_key` (khai báo trong compose) — thiếu thì
+    `backup-crypt.sh` báo lỗi ngay chứ không im lặng.
+
 - **Sandbox KHÔNG được promote.** `pitr-sandbox` dừng bằng
   `recovery_target_action=pause`, gắn archive read-only và chạy
   `archive_mode=off`. Promote là sinh file `.history` của một timeline mới
@@ -564,7 +602,7 @@ Xem mục 7c trong `README.md`. Phần dễ sai:
 - **Kiểm tra chặn replication phải dùng `replication=true`** (vật lý, thứ
   `pg_basebackup` dùng). `replication=database` là logic, khớp dòng `all`
   thông thường nên KHÔNG đi vào nhánh `replication` của `pg_hba`.
-- `pitr_restore.sh` cất data cũ vào `backup/full/pre_pitr_*.tar.gz` trước khi
+- `pitr_restore.sh` cất data cũ (mã hóa) vào `backup/full/pre_pitr_*.tar.gz.gpg` trước khi
   ghi đè — lưới an toàn nếu chọn nhầm thời điểm.
 - **PITR quay lui cả `audit.alerts` nhưng không quay lui `analyzer/state/`.**
   `pitr_restore.sh` tạm dừng analyzer rồi ghi bù bằng `--replay-after=<thoi_diem
@@ -581,7 +619,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 129 phép thử, phải đạt hết
+bash scripts/verify.sh         # 145 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

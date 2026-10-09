@@ -13,7 +13,7 @@
 #   2. Chưa có .env -> sinh từ .env.example, thay mọi mật khẩu mẫu bằng chuỗi
 #      ngẫu nhiên. Đã có .env thì GIỮ NGUYÊN.
 #   3. scripts/reset.sh  (dọn volume/WAL/log, sinh secrets/, build, chờ init xong)
-#   4. scripts/verify.sh (129 phép thử)
+#   4. scripts/verify.sh (145 phép thử)
 #   5. In địa chỉ app/dashboard và tài khoản demo.
 #
 # Không cần cài Node trên máy: app, analyzer, dashboard đều chạy trong Docker.

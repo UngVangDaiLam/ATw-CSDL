@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
@@ -14,6 +15,18 @@ function num(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// TLS tới database, xác thực server bằng CA của lab (verify-full). Thiếu CA thì
+// dừng lại chứ không lùi về kết nối không mã hóa. Cùng cách với app/src/db.js.
+function sslConfig() {
+  const caFile = process.env.DB_SSL_ROOT_CERT
+    || path.resolve(ROOT, '..', 'secrets', 'tls_ca.crt');
+  try {
+    return { ca: fs.readFileSync(caFile, 'utf8'), rejectUnauthorized: true };
+  } catch (err) {
+    throw new Error(`Khong doc duoc CA TLS ${caFile} (${err.code}). Chay: bash scripts/init-secrets.sh`);
+  }
+}
+
 export default {
   // PHẢI là dashboard_user — role CHỈ có SELECT trên audit.alerts. Xem
   // dashboard/README.md mục 3 và postgres/init/04_grants.sql.
@@ -23,6 +36,7 @@ export default {
     database: process.env.DB_NAME || 'secdb',
     user: process.env.DB_USER || 'dashboard_user',
     password: process.env.DB_PASSWORD,
+    ssl: sslConfig(),
     max: 2,
   },
 

@@ -79,7 +79,21 @@ if [ -z "$YES" ]; then
     fi
 fi
 
-echo "==> [1/6] Day WAL con lai ra kho archive"
+# Đo thời gian từng bước (RTO thực đo). phase "<nhãn>" đóng bước trước, mở bước
+# mới; phase_end đóng bước cuối. PITR_TIMING_FILE (tùy chọn, demo_pitr.sh đặt):
+# ghi "<giây><TAB><nhãn>" mỗi bước để script gọi tổng hợp thành báo cáo.
+now_s() { date +%s.%N; }
+PH_LABEL=""; PH_T0=""; PH_ROWS=""
+phase_end() {
+    [ -n "$PH_LABEL" ] || return 0
+    local d; d=$(awk -v a="$PH_T0" -v b="$(now_s)" 'BEGIN { printf "%.1f", b - a }')
+    echo "    (mat ${d}s)"
+    PH_ROWS+="${d}"$'\t'"${PH_LABEL}"$'\n'
+    PH_LABEL=""
+}
+phase() { phase_end; PH_LABEL="$1"; PH_T0=$(now_s); echo "==> $1"; }
+
+phase "[1/6] Day WAL con lai ra kho archive"
 echo "    segment cuoi: $(flush_wal)"
 
 # Tạm dừng analyzer trong Docker (nếu đang chạy) - bật lại ở cuối.
@@ -93,14 +107,14 @@ restart_analyzer() {
 # Hỏng giữa chừng cũng phải bật lại analyzer.
 trap restart_analyzer EXIT
 
-echo "==> [2/6] Dung analyzer (neu co) va postgres"
+phase "[2/6] Dung analyzer (neu co) va postgres"
 [ -n "$ANALYZER_WAS_UP" ] && docker compose stop analyzer
 docker compose stop postgres
 
-echo "==> [3/6] Dung lai data directory tu base backup"
+phase "[3/6] Dung lai data directory tu base backup"
 docker compose run --rm -T pitr-restore -s -- live "$BASE" "$TARGET" < backup/scripts/_restore_inner.sh
 
-echo "==> [4/6] Khoi dong postgres - replay WAL toi $TARGET_SHOW"
+phase "[4/6] Khoi dong postgres - replay WAL toi $TARGET_SHOW"
 docker compose up -d postgres
 DONE=""
 for _ in $(seq 1 90); do
@@ -113,7 +127,7 @@ if [ -z "$DONE" ]; then
     exit 1
 fi
 
-echo "==> [5/6] Xoa cau hinh recovery khoi postgresql.auto.conf"
+phase "[5/6] Xoa cau hinh recovery khoi postgresql.auto.conf"
 # Để lại thì vô hại lúc này (recovery.signal đã bị xóa khi promote), nhưng
 # lần PITR sau sẽ ghi chồng thêm một bộ tham số nữa vào cùng file.
 _su "ALTER SYSTEM RESET restore_command;" >/dev/null
@@ -127,7 +141,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-echo "==> [6/6] Ghi bu canh bao cua cac su kien sau moc khoi phuc"
+phase "[6/6] Ghi bu canh bao cua cac su kien sau moc khoi phuc"
 # Mốc = thoi_diem lớn nhất trong các cảnh báo CÒN LẠI sau khôi phục (chỉ
 # superuser đọc được; analyzer_user không có SELECT). Sự kiện tới mốc đó đã có
 # cảnh báo, sự kiện sau mốc thì chưa - xem analyzer/src/index.js --replay-after.
@@ -144,6 +158,16 @@ else
 fi
 restart_analyzer
 trap - EXIT
+
+phase_end
+
+echo "==> Thoi gian tung buoc"
+printf '%s' "$PH_ROWS" | awk -F'\t' '{ printf "    %7.1fs  %s\n", $1, $2 }'
+# RTO = bước 1-5: từ lúc bắt đầu khôi phục tới lúc database nhận kết nối TCP
+# trở lại. Bước 6 (ghi bù cảnh báo) chạy khi dịch vụ đã lên nên tính riêng.
+printf '%s' "$PH_ROWS" | awk -F'\t' '{ t += $1; if ($2 !~ /^\[6\/6\]/) r += $1 }
+    END { printf "    RTO (buoc 1-5, database nhan ket noi tro lai): %.1fs\n    Tong ca ghi bu canh bao (buoc 6)             : %.1fs\n", r, t }'
+[ -n "${PITR_TIMING_FILE:-}" ] && printf '%s' "$PH_ROWS" > "$PITR_TIMING_FILE"
 
 echo "==> Xong. Da khoi phuc ve $TARGET_SHOW"
 echo "    Timeline moi : $(timeline)"

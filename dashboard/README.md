@@ -100,11 +100,12 @@ Các rule và gợi ý màu:
 |------|------|------|
 | `IDENTITY_WITHOUT_SESSION` | 50–95 | `SET ROLE` sang vai nhân viên mà không có token phiên của người đó — `db_user` là `app_user`, vai bị mạo danh ở `detail.vai_khong_co_phien` |
 | `HONEYTOKEN_ACCESS` | 98 | giải mã CCCD của khách hàng mồi (honeytoken) — một dòng là đủ |
+| `SQLI_STACKED` | 85–95 | nhiều câu lệnh nối nhau trong một chuỗi truy vấn; 95 nếu chuỗi tự kết thúc transaction mà nó không mở — từ khóa đầu từng câu ở `detail.cac_cau` |
 | `SQLI_UNION` | 90 | câu lệnh có `UNION ... SELECT` |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã hàng loạt CCCD |
 | `SQLI_TAUTOLOGY` | 85 | `OR 1=1`, `OR 'a'='a'` |
 | `PRIVILEGE_ESCALATION` | 75–95 | tắt RLS, xóa policy, `GRANT ... TO PUBLIC`, cấp role, hàm `SECURITY DEFINER`, thuộc tính `SUPERUSER`/`BYPASSRLS`, đổi cấu hình pgAudit |
-| `ACCESS_DENIED` | 65–85 | câu lệnh bị PostgreSQL từ chối quyền (85 nếu nhắm vào `password_hash` / `app.staff`) |
+| `ACCESS_DENIED` | 65–90 | câu lệnh bị PostgreSQL từ chối quyền (85 nếu nhắm vào `password_hash` / `app.staff`; 90 nếu là giải mã không có phiên nhân viên) |
 | `STAFF_CREDENTIAL_READ` | 75 | nhân viên đọc bảng chứa `password_hash` |
 | `SQLI_SCHEMA_PROBE` | 70 | dò `information_schema` / `pg_catalog` |
 | `FULL_TABLE_READ` | 60 | đọc bảng nhạy cảm không có `WHERE` |

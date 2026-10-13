@@ -156,6 +156,12 @@ Lớp 3 vẫn thấy lần tấn công bị chặn: câu lệnh bị từ chối
 AUDIT, nhưng có dòng `ERROR` (SQLSTATE `42501`) trong log; analyzer đọc nó và
 sinh `ACCESS_DENIED` + `SQLI_UNION`, quy về đúng nhân viên.
 
+**Nhiều câu lệnh trong một chuỗi.** `query(sql)` ở endpoint này không có tham
+số, nên node-pg gửi bằng giao thức *simple query* — giao thức cho phép một
+chuỗi chứa nhiều câu lệnh. Bản review của nhóm báo cáo rằng nhờ đó SQLi có thể
+sửa dữ liệu của chính chi nhánh người gửi; lab chưa tái hiện được nên chưa có
+số liệu (xem `README.md` mục 8). Lớp 3 có rule `SQLI_STACKED` cho dạng này.
+
 ### 2. IDOR — `GET /orders/:id`
 
 Không kiểm tra đơn hàng có thuộc chi nhánh của người đang đăng nhập hay

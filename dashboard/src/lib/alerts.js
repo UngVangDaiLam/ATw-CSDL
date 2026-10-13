@@ -14,6 +14,11 @@ export const RULES = {
     label: 'Mạo danh nhân viên',
     hint: 'SET ROLE sang vai nhân viên nhưng không có token phiên đăng nhập của người đó — RLS trả 0 dòng (50 nếu chỉ là token hết hạn)',
   },
+  SQLI_STACKED: {
+    score: 95,
+    label: 'SQL Injection · nối câu lệnh',
+    hint: 'Nhiều câu lệnh nối nhau bằng ; trong một chuỗi truy vấn từ phiên ứng dụng — 95 nếu chuỗi tự kết thúc transaction mà nó không mở, 85 nếu chỉ nối thêm câu',
+  },
   SQLI_UNION: {
     score: 90,
     label: 'SQL Injection · UNION',
@@ -42,7 +47,7 @@ export const RULES = {
   ACCESS_DENIED: {
     score: 85,
     label: 'Bị từ chối quyền',
-    hint: 'PostgreSQL từ chối câu lệnh (vd. đọc password_hash) — lớp 1 đã chặn, cảnh báo là dấu vết lần thử (65, hoặc 85 nếu nhắm vào thông tin đăng nhập)',
+    hint: 'PostgreSQL từ chối câu lệnh (vd. đọc password_hash) — lớp 1 đã chặn, cảnh báo là dấu vết lần thử (65; 85 nếu nhắm vào thông tin đăng nhập; 90 nếu là giải mã không có phiên nhân viên)',
   },
   SQLI_SCHEMA_PROBE: {
     score: 70,

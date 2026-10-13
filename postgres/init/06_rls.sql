@@ -53,7 +53,24 @@ AS $$
 --   (thứ app_user có với MỌI nv_*) không còn đủ: phải có token, mà token chỉ
 --   cấp khi nhập đúng mật khẩu nhân viên (app.verify_staff_login).
 -- ly_do: vì sao branch_id là NULL - chỉ điền khi p_db_user là role của một
---   nhân viên (readonly_user, app_user chưa SET ROLE, db_owner: không phải).
+--   nhân viên đang được mang qua SET ROLE (app_user chưa SET ROLE, db_owner:
+--   không phải).
+--
+-- NGOẠI LỆ - role TỰ ĐĂNG NHẬP (p_db_user = session_user): không cần token.
+--   Token tồn tại để vá một chỗ duy nhất: app_user là thành viên mọi nv_* nên
+--   SET ROLE không chứng minh được gì. Role kết nối bằng mật khẩu của CHÍNH NÓ
+--   (readonly_user - có dòng trong app.staff, chi nhánh 1) thì PostgreSQL đã
+--   xác thực rồi; nó không đăng nhập qua app nên cũng không bao giờ có token.
+--   Thiếu nhánh này readonly_user đọc ra 0 dòng và mỗi truy vấn hợp lệ của nó
+--   ghi một dòng LOG "mạo danh".
+--   Không mượn được nhánh này để vòng qua token:
+--   - session_user là role ĐÃ XÁC THỰC của kết nối. SECURITY DEFINER không đổi
+--     nó (khác current_user), SET ROLE cũng không; chỉ superuser đổi được bằng
+--     SET SESSION AUTHORIZATION - mà superuser vốn bỏ qua RLS.
+--   - Các role nv_* đều NOLOGIN nên không bao giờ là session_user.
+--   - app_user tự đăng nhập nhưng không có dòng nào trong app.staff -> vẫn NULL.
+--   - Gọi thẳng app.branch_of('readonly_user', ...) từ phiên app_user thì
+--     p_db_user <> session_user -> đi nhánh token như mọi vai khác.
 --
 -- Hàm này KHÔNG tự ghi log. Ai cũng gọi thẳng được nó với tên role tùy ý; nếu
 -- nó RAISE LOG thì ai cũng sinh được dòng "nv_hcm01 bị mạo danh" mang đúng
@@ -65,6 +82,13 @@ DECLARE
     v_active boolean;
     v_branch int;
 BEGIN
+    IF p_db_user = session_user THEN
+        SELECT s.branch_id INTO branch_id
+          FROM app.staff s
+         WHERE s.db_user = p_db_user AND s.is_active;
+        RETURN;
+    END IF;
+
     IF p_token IS NOT NULL AND p_token <> '' THEN
         SELECT s.db_user, t.expires_at > now(), s.is_active, s.branch_id
           INTO v_owner, v_live, v_active, v_branch

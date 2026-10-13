@@ -221,17 +221,51 @@ không bao giờ thấy) vẫn bị bắt ngay lần chạm mồi đầu tiên. 
 |------|------|------------|
 | `IDENTITY_WITHOUT_SESSION` | 50–95 | `SET ROLE` sang vai nhân viên mà **không có token phiên** của người đó (RLS trả 0 dòng); quy cho session user — mục "Mạo danh vai" |
 | `HONEYTOKEN_ACCESS` | 98 | giải mã CCCD của **bản ghi mồi** — dù chỉ một dòng, dù quyền hợp lệ (mục "Bản ghi mồi" ở trên) |
+| `SQLI_STACKED` | 85–95 | **nhiều câu lệnh nối nhau** trong một chuỗi truy vấn; 95 nếu chuỗi tự kết thúc transaction mà nó không mở — mục "Nối câu lệnh" bên dưới |
 | `SQLI_UNION` | 90 | câu lệnh chứa `UNION ... SELECT` — dấu vết khai thác đọc sang bảng khác |
 | `BULK_DECRYPT` | 70–95 | một câu lệnh giải mã ≥ `BULK_DECRYPT_THRESHOLD` bản ghi (điểm tăng theo khối lượng) |
 | `SQLI_TAUTOLOGY` | 85 | điều kiện luôn đúng kiểu `OR 1=1`, `OR 'a'='a'` |
 | `PRIVILEGE_ESCALATION` | 75–95 | leo thang đặc quyền / gỡ lớp bảo vệ bằng câu lệnh hợp lệ (class `ROLE`/`DDL`), kể cả lần thử bị từ chối — chi tiết bên dưới |
-| `ACCESS_DENIED` | 65–85 | câu lệnh bị PostgreSQL **từ chối quyền** (SQLSTATE `42501`); 85 nếu nhắm vào `password_hash` / `app.staff` |
+| `ACCESS_DENIED` | 65–90 | câu lệnh bị PostgreSQL **từ chối quyền** (SQLSTATE `42501`); 85 nếu nhắm vào `password_hash` / `app.staff`; 90 nếu là **giải mã không có phiên nhân viên** (chốt của `app.decrypt_text()`, khi đó quy cho session user) |
 | `STAFF_CREDENTIAL_READ` | 75 | đọc `app.staff` **từ phiên đã `SET ROLE`** |
 | `SQLI_SCHEMA_PROBE` | 70 | truy vấn `pg_catalog` / `information_schema` từ phiên ứng dụng |
 | `FULL_TABLE_READ` | 60 | `SELECT` trên bảng nhạy cảm mà không có `WHERE` |
 | `AFTER_HOURS` | 40 | chạm dữ liệu ngoài 7h–19h hoặc cuối tuần |
 | `LOGIN_BRUTE_FORCE` | 80–90 | **tầng web:** đăng nhập sai tới mức bị khóa tạm (90 nếu khóa cả IP) |
 | `CSRF_BLOCKED` | 50–70 | **tầng web:** request ghi bị chặn vì gửi dạng form (70) hoặc thiếu/sai CSRF token (50) |
+
+### Nối câu lệnh (`SQLI_STACKED`)
+
+`/customers/search` gọi `query(sql)` không tham số, nên node-pg gửi bằng giao
+thức *simple query* — thứ cho phép một chuỗi chứa nhiều câu lệnh cách nhau
+bằng `;`. Một chuỗi như vậy không cần `UNION`, `OR 1=1` hay catalog, nên ba
+rule `SQLI_*` còn lại không thấy.
+
+pgAudit ghi mỗi câu trong chuỗi thành một dòng riêng, dòng nào cũng mang nguyên
+văn cả chuỗi, nên chỉ cần tách chuỗi đó ra. Hai dấu hiệu, chỉ xét khi chuỗi có
+từ hai câu trở lên:
+
+- **(95)** có lệnh kết thúc transaction (`COMMIT` / `END` / `ROLLBACK` /
+  `ABORT`) mà chính chuỗi đó không mở transaction trước;
+- **(85)** câu **đầu tiên** là câu dữ liệu (`SELECT`, `INSERT`…). Truy vấn của
+  app bắt đầu như vậy và chỉ có một câu; có thêm câu phía sau là bị nối vào.
+
+Chuỗi hợp lệ của script quản trị không dính cả hai: nó bắt đầu bằng
+`SET ROLE x; ...` hoặc tự mở `BEGIN; ...; ROLLBACK;`.
+
+Tách bằng **bộ đọc từ**, không bằng regex: dấu `;` nằm trong chuỗi ký tự,
+trong tên `"có;dấu"`, trong `$$thân hàm$$` hay trong chú thích đều không ngắt
+câu — khách hàng tên `Cong ty A; update gia` là dữ liệu hợp lệ. Hai chi tiết dễ
+sai: `\` **không** phải ký tự thoát trong chuỗi thường (chỉ trong `E'...'`), và
+`ROLLBACK TO SAVEPOINT` không kết thúc transaction.
+
+Mỗi câu dữ liệu trong chuỗi sinh một cảnh báo (pgAudit ghi từng câu):
+`detail.lenh` cho biết cảnh báo đó của câu nào, `detail.cac_cau` liệt kê từ khóa
+đầu của từng câu. Từ lạ ghi thành `?` — cảnh báo không chép lại văn bản tùy ý.
+
+**Mức kiểm chứng:** bộ tách câu đã thử rời trên các ca trên; `verify.sh` chỉ có
+phép đối chứng báo nhầm (dấu `;` trong chuỗi ký tự không kích hoạt rule). Chưa
+có phép thử đầu-cuối cho một chuỗi nhiều câu lệnh thật đi qua app.
 
 ### Hai rule cuối đến từ tầng web, không từ log pgAudit
 

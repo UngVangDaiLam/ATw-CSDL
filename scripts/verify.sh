@@ -42,6 +42,9 @@ sql_nv() { local tv="TOK_$1"; sql_tok "${!tv:-}" "$1" "$2"; }
 sql_an() { docker compose exec -T postgres psql "postgresql://analyzer_user:${ANALYZER_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 # psql dưới quyền dashboard_user (TCP) - lớp 3 chiều đọc, chỉ SELECT audit.alerts
 sql_db() { docker compose exec -T postgres psql "postgresql://dashboard_user:${DASHBOARD_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
+# psql dưới quyền readonly_user (TCP) - role TỰ ĐĂNG NHẬP, không qua app nên
+# không có token phiên; RLS nhận nó qua session_user (06_rls.sql, app.branch_of)
+sql_ro() { docker compose exec -T postgres psql "postgresql://readonly_user:${READONLY_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mDAT  \033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mTRUOT\033[0m %s\n' "$1"; printf '        mong doi: %s\n        nhan duoc: %s\n' "$2" "$3"; }
@@ -143,6 +146,26 @@ expect "policy RLS tinh chi nhanh 1 lan/cau lenh (InitPlan), khong phai moi dong
        "$(sql_nv nv_hn01 'EXPLAIN SELECT phone FROM app.customers ORDER BY id LIMIT 100;')"
 expect "db_owner bi FORCE RLS chan -> 0 dong" "0" \
        "$(sql_su 'SET ROLE db_owner; SELECT count(*) FROM app.customers;' | tail -1)"
+# readonly_user co dong trong app.staff (chi nhanh 1) nhung dang nhap thang bang
+# mat khau cua chinh no, khong qua app - khong bao gio co token phien. Truoc day
+# rang buoc token lam no doc ra 0 dong, va moi truy van HOP LE cua no ghi mot
+# dong LOG "mao danh". Cac phep thu khac cua role nay deu la "bi tu choi" nen
+# khong phep nao thay. Dem dong LOG truoc/sau thay vi "phai bang 0": log cua lan
+# chay truoc van con trong logs/.
+ro_identity_lines() { cat logs/*.json 2>/dev/null | grep -cF 'SECDB_IDENTITY_WITHOUT_SESSION role=readonly_user'; }
+RO_LOG_BEFORE="$(ro_identity_lines)"
+expect_eq "readonly_user doc duoc khach hang, va chi cua chi nhanh 1" "t|1|1" \
+          "$(sql_ro 'SELECT count(*) > 0, min(branch_id), max(branch_id) FROM app.customers;')"
+expect_eq "readonly_user doc duoc don hang, va chi cua chi nhanh 1" "t|1|1" \
+          "$(sql_ro 'SELECT count(*) > 0, min(branch_id), max(branch_id) FROM app.orders;')"
+sleep 2
+RO_LOG_AFTER="$(ro_identity_lines)"
+if [ "$RO_LOG_BEFORE" = "$RO_LOG_AFTER" ]; then ok "truy van hop le cua readonly_user KHONG ghi dong LOG mao danh"
+else bad "truy van hop le cua readonly_user KHONG ghi dong LOG mao danh" "$RO_LOG_BEFORE dong (khong tang)" "$RO_LOG_AFTER dong"; fi
+# Nhanh "tu dang nhap" chi mo cho chinh phien cua role do: app_user goi thang
+# ham voi ten readonly_user thi van phai co token nhu moi vai khac.
+expect_eq "app_user KHONG muon duoc nhanh tu dang nhap cua readonly_user" "null" \
+          "$(sql_app "SELECT coalesce(branch_id::text, 'null') FROM app.branch_of('readonly_user', NULL);")"
 
 # -----------------------------------------------------------------------------
 section "LOP 2 - Ma hoa cot bang pgcrypto"
@@ -166,6 +189,33 @@ expect "giai ma ban ghi moi van tra CCCD binh thuong (nguoi goi khong nhan ra)" 
        "$(sql_nv nv_dn01 "SELECT app.decrypt_text(cccd) FROM app.customers WHERE email = 'kh6001@example.local';")"
 expect "readonly_user KHONG doc duoc cot cccd (quyen muc COT)" "permission denied for table customers" \
        "$(docker compose exec -T postgres psql "postgresql://readonly_user:${READONLY_PASSWORD}@172.28.0.10:5432/secdb" -tAc 'SELECT cccd FROM app.customers;' 2>&1)"
+
+# Chot phien cua viec giai ma (app.assert_staff_session, 05_crypto.sql).
+# app.decrypt_text() chi nhan ban ma, khong biet dong do cua chi nhanh nao - RLS
+# chan viec DOC ban ma tu bang, khong chan ban ma lay tu nguon khac. Lay mot ban
+# ma chi nhanh 2 bang superuser de gia lap dung tinh huong do (ban sao luu bi lo
+# cung khoa sao luu). id <= 300: khach that, khong phai ban ghi moi.
+CIPHER_CN2="$(sql_su "SELECT encode(cccd, 'hex') FROM app.customers WHERE branch_id = 2 AND cccd IS NOT NULL AND id <= 300 ORDER BY id LIMIT 1;" | tr -d '[:space:]')"
+DEC_CN2="SELECT app.decrypt_text('\\x${CIPHER_CN2}'::bytea);"
+expect "app_user chua SET ROLE KHONG goi duoc app.decrypt_text" "permission denied for function decrypt_text" \
+       "$(sql_app "$DEC_CN2")"
+# SET ROLE thi co lai EXECUTE (qua staff_role) ma khong can token - chot nam
+# trong ham moi la thu chan that.
+expect "SET ROLE nv_dn01 KHONG token: khong giai ma duoc ban ma dua tu ngoai vao" "SECDB_DECRYPT_WITHOUT_SESSION role=nv_dn01 ly_do=khong_co_token" \
+       "$(sql_tok '' nv_dn01 "$DEC_CN2")"
+expect "token cua nv_hn01 nhung SET ROLE nv_dn01: khong giai ma duoc" "SECDB_DECRYPT_WITHOUT_SESSION role=nv_dn01 ly_do=token_cua_nguoi_khac" \
+       "$(sql_tok "$TOK_nv_hn01" nv_dn01 "$DEC_CN2")"
+# Doi chung: cung ban ma do, phien hop le thi ra CCCD - ba lan tu choi o tren la
+# do thieu phien, khong phai do ban ma hong.
+if sql_nv nv_dn01 "$DEC_CN2" | tr -d '[:space:]' | grep -qE '^[0-9]{12}$'; then
+    ok "doi chung: cung ban ma, nv_dn01 CO token dung -> giai ma duoc"
+else bad "doi chung: cung ban ma, nv_dn01 CO token dung -> giai ma duoc" "12 chu so" "khong ra CCCD (ban ma rong? ${#CIPHER_CN2} ky tu hex)"; fi
+# Duong quan tri: superuser qua socket van giai ma duoc (xoay khoa, README muc
+# 8). Da SET ROLE xuong db_owner thi KHONG - cung ly do db_owner bi FORCE RLS.
+expect "superuser qua unix socket van giai ma duoc (duong quan tri)" "001201000001" \
+       "$(sql_su 'SELECT app.decrypt_text(cccd) FROM app.customers ORDER BY id LIMIT 1;')"
+expect "db_owner KHONG giai ma duoc (phan tach nhiem vu, nhu FORCE RLS)" "SECDB_DECRYPT_WITHOUT_SESSION role=db_owner" \
+       "$(sql_su "SET ROLE db_owner; $DEC_CN2")"
 
 # Phép thử quan trọng nhất của lớp 2: kẻ lấy được bản dump có đọc được gì không.
 DUMP="$(mktemp)"
@@ -363,6 +413,11 @@ else
     sql_nv nv_dn01 "SELECT 'verify_khong_moi', count(app.decrypt_text(cccd)) FROM app.customers WHERE id <= 300;" >/dev/null
     # Mao danh: SET ROLE nv_dn01 khong co token phien (mat khau app_user bi lo).
     sql_tok '' nv_dn01 "SELECT 'verify_mao_danh', count(*) FROM app.customers;" >/dev/null
+    # Giai ma lau: cung ke do, dua vao mot ban ma lay tu nguon khac (CIPHER_CN2,
+    # muc LOP 2). Khong cham bang nao nen app.current_branch_id() khong chay,
+    # khong co dong LOG mao danh - chot phien cua app.decrypt_text() bao loi
+    # 42501 va analyzer doc dong do.
+    sql_tok '' nv_dn01 "SELECT 'verify_giai_ma_lau', app.decrypt_text('\\x${CIPHER_CN2}'::bytea);" >/dev/null
     # Hai cach gia dong LOG mao danh de do toi nguoi vo toi (nv_hcm01):
     #   - khoi DO tu RAISE LOG dung noi dung -> context inline_code_block;
     #   - goi thang app.branch_of('nv_hcm01', ...) voi ten role tuy y -> ham do
@@ -433,6 +488,13 @@ else
     if printf '%s' "$KHONG_MOI" | grep -q 'IDENTITY_WITHOUT_SESSION'; then
         bad "doi chung: co token dung KHONG bi coi la mao danh" "khong co" "co canh bao"
     else ok "doi chung: co token dung KHONG bi coi la mao danh"; fi
+    # Lan thu giai ma bi chot phien tu choi phai hien o lop 3, va - nhu moi vai
+    # mao danh - quy cho app_user chu khong cho nhan vien bi muon ten.
+    GIAI_MA_LAU="$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_giai_ma_lau'" | grep 'ACCESS_DENIED')"
+    if printf '%s' "$GIAI_MA_LAU" | grep -q 'app_user' && ! printf '%s' "$GIAI_MA_LAU" | grep -q 'nv_dn01'; then
+        ok "giai ma khong co phien -> ACCESS_DENIED, quy cho app_user (khong cho nv_dn01)"
+    else bad "giai ma khong co phien -> ACCESS_DENIED, quy cho app_user (khong cho nv_dn01)" \
+             "ACCESS_DENIED app_user" "${GIAI_MA_LAU:-khong co canh bao}"; fi
     NE_TRACH="$(printf '%s' "$ANALYZER_OUT" | grep -B2 -F "'verify_ne_trach'")"
     if printf '%s' "$NE_TRACH" | grep -q 'BULK_DECRYPT.*nv_hn01' && ! printf '%s' "$NE_TRACH" | grep -q 'app_user'; then
         ok "chen loi goi branch_of cho vai khac KHONG day duoc trach nhiem sang app_user"
@@ -647,6 +709,12 @@ else bad "loi CSDL tra ve ma tham chieu, KHONG lo ten bang/rang buoc" "{ref, tho
 if [ -n "$ERR_REF" ] && docker compose logs --no-log-prefix app 2>/dev/null | grep -q "\[loi $ERR_REF\].*foreign key"; then
     ok "chi tiet loi nam trong log server, tra duoc bang ma tham chieu"
 else bad "chi tiet loi nam trong log server, tra duoc bang ma tham chieu" "[loi $ERR_REF] ... foreign key" "khong thay trong docker compose logs app"; fi
+
+# SQLI_STACKED - doi chung bao nham: dau ";" nam TRONG mot chuoi ky tu la du lieu, khong
+# phai cau lenh thu hai. Kem OR 1=1 de cau nay CHAC CHAN co canh bao
+# (SQLI_TAUTOLOGY): "khong co SQLI_STACKED" khi do moi la ket luan, chu khong
+# phai dat vi analyzer khong thay cau lenh.
+sql_nv nv_dn01 "SELECT 'verify_cham_phay; COMMIT; trong chuoi', count(*) FROM app.customers WHERE id < 0 OR 1=1;" >/dev/null
 rm -f "$JAR"
 
 # Su kien tang web -> lop 3. Cac phep thu o tren vua gay ra mot lan khoa dang
@@ -665,6 +733,11 @@ else
     expect "analyzer bien do mat khau thanh canh bao LOGIN_BRUTE_FORCE" "$BF_USER" \
            "$(printf '%s' "$WEB_ALERTS" | grep -A1 'LOGIN_BRUTE_FORCE')"
     expect "analyzer bien request CSRF bi chan thanh canh bao CSRF_BLOCKED" "CSRF_BLOCKED" "$WEB_ALERTS"
+    CHAM_PHAY="$(printf '%s' "$WEB_ALERTS" | grep -B2 -F 'verify_cham_phay' | grep -E '^\[')"
+    if printf '%s' "$CHAM_PHAY" | grep -q 'SQLI_TAUTOLOGY' && ! printf '%s' "$CHAM_PHAY" | grep -q 'SQLI_STACKED'; then
+        ok "doi chung: dau ; trong chuoi ky tu KHONG bi coi la noi cau lenh"
+    else bad "doi chung: dau ; trong chuoi ky tu KHONG bi coi la noi cau lenh" \
+             "SQLI_TAUTOLOGY, khong co SQLI_STACKED" "$(printf '%s' "$CHAM_PHAY" | tr '\n' ' ' | cut -c1-120)"; fi
 fi
 
 # Giao dien web (app/web -> public/) phuc vu cung origin voi API, va cung mang

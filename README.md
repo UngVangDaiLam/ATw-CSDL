@@ -12,7 +12,7 @@ Môi trường lab chạy local bằng Docker Compose, minh họa 4 lớp bảo 
 Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socket.IO
 
 Chạy thử: `bash scripts/quickstart.sh` (hoặc bấm đúp `quickstart.bat`) — một lệnh
-dựng lab và chạy 145 phép thử nghiệm thu. Chi tiết ở mục 2.
+dựng lab và chạy 157 phép thử nghiệm thu. Chi tiết ở mục 2.
 
 ---
 
@@ -71,7 +71,7 @@ Oracle / SQL Server / AWS, kể cả những chỗ lab thua:
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 145 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 157 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -112,7 +112,7 @@ Oracle / SQL Server / AWS, kể cả những chỗ lab thua:
 │       ├── sessions.js     # gom dòng -> câu lệnh, bám session_id để quy trách nhiệm
 │       ├── redact.js       # che CCCD/số thẻ trước khi ghi cảnh báo
 │       ├── alerts.js       # INSERT bằng analyzer_user
-│       └── rules/          # 11 rule trên log PostgreSQL (2 rule tầng web ở src/appEvents.js)
+│       └── rules/          # 12 rule trên log PostgreSQL (2 rule tầng web ở src/appEvents.js)
 └── dashboard/              # React + Socket.IO, đọc audit.alerts bằng dashboard_user - xem dashboard/README.md
 ```
 
@@ -258,7 +258,7 @@ chỉ với các role nghiệp vụ.
 | `app_user` | có | `SELECT, INSERT, UPDATE` trên `customers`, `orders`, `payments`. `SELECT` trên `app.staff` **trừ cột `password_hash`** (quyền mức cột); đăng nhập qua `app.verify_staff_login()`. **Không** DELETE, **không** DDL, **không** chạm `audit`. Chưa `SET ROLE` thì **đọc ra 0 dòng** |
 | `staff_role` | không | role nhóm, giữ quyền trên bảng cho nhân viên. Cũng không đọc được `password_hash`, không gọi được hàm kiểm tra mật khẩu |
 | `nv_hn01` `nv_dn01` `nv_hcm01` | **không** (`NOLOGIN`) | nhân viên từng chi nhánh. Chỉ vào được bằng `SET ROLE` từ `app_user` |
-| `readonly_user` | có | `SELECT` trên `customers`, `orders` của chi nhánh mình. Bị ép `default_transaction_read_only = on` |
+| `readonly_user` | có | `SELECT` trên `customers`, `orders` của chi nhánh mình (chi nhánh 1, theo dòng của nó trong `app.staff`). Tự đăng nhập bằng mật khẩu riêng nên RLS không đòi token phiên. Bị ép `default_transaction_read_only = on` |
 | `admin_user` | có | không có quyền trực tiếp trên bảng; `SET ROLE db_owner` để làm DDL |
 | `analyzer_user` | có | **chỉ `INSERT` trên `audit.alerts`** — không đọc, không sửa, không xóa; không chạm được schema `app` |
 | `dashboard_user` | có | **chỉ `SELECT` trên `audit.alerts`** — không ghi (không chèn được cảnh báo giả); không chạm được schema `app`. Phiên mặc định read-only |
@@ -315,6 +315,18 @@ Repo gỡ giới hạn đó bằng **token phiên đăng nhập**:
 4. Bị từ chối như vậy thì hàm ghi một dòng `LOG` vào log server (người gọi
    không thấy); analyzer biến nó thành `IDENTITY_WITHOUT_SESSION`, quy cho
    **`app_user`** chứ không cho nhân viên bị mạo danh.
+5. **Giải mã đòi cùng token đó.** `app.decrypt_text()` chỉ nhận bản mã nên tự
+   nó không biết dòng ấy của chi nhánh nào; không có chốt này thì ai `SET ROLE`
+   được (tức ai cầm mật khẩu `app_user`) là giải mã được mọi bản mã lấy từ
+   nguồn khác — bản sao lưu bị lộ chẳng hạn. Thiếu token hợp lệ thì hàm báo lỗi
+   `42501`, analyzer đọc dòng lỗi đó thành `ACCESS_DENIED`.
+
+Token chỉ vá đúng một chỗ: `SET ROLE` không chứng minh được danh tính. Role **tự
+đăng nhập** bằng mật khẩu của chính nó — `readonly_user` — đã được PostgreSQL
+xác thực, nên RLS nhận chi nhánh của nó qua `session_user` mà không cần token
+(nó không đi qua app nên cũng không bao giờ có token). Nhánh này không mượn
+được: `session_user` không đổi theo `SET ROLE` hay `SECURITY DEFINER`, còn các
+role `nv_*` đều `NOLOGIN`.
 
 Token lưu ở server thay cho token tự ký (HMAC) là có chủ đích: kiểm chữ ký phải
 đọc khóa từ Docker secret mỗi câu lệnh (~0,6 ms), còn tra bảng theo khóa chính
@@ -431,9 +443,14 @@ cùng hash). Với CCCD thì chấp nhận được vì nó vốn là định da
 ### Ai chạm được vào cái gì
 
 - `nv_hn01` / `nv_dn01` / `nv_hcm01` — giải mã được, **nhưng chỉ trên các dòng
-  RLS cho phép thấy**. Hai lớp xếp chồng.
-- `app_user` — có `EXECUTE` trên ba hàm, nhưng chưa `SET ROLE` thì RLS không
-  cho thấy dòng nào để mà giải mã.
+  RLS cho phép thấy**, và chỉ khi phiên mang token đăng nhập còn hạn của đúng
+  nhân viên đó (`app.assert_staff_session()` bên trong `app.decrypt_text()`).
+  Hai lớp xếp chồng.
+- `app_user` — có `EXECUTE` trên `app.encrypt_text()` và `app.blind_index()`,
+  **không** có trên `app.decrypt_text()`: phiên chưa `SET ROLE` không có lý do gì
+  để giải mã. `SET ROLE nv_xxx` thì có lại quyền gọi (qua `staff_role`), nhưng
+  không có token thì hàm từ chối — kể cả với bản mã đưa từ ngoài vào, thứ RLS
+  không chặn được.
 - `readonly_user` — **không đọc được cả cột `cccd`**. Đây là phân quyền ở mức
   cột, nằm trước cả mã hóa. Hệ quả: `SELECT *` bị từ chối, phải liệt kê cột.
 - Không role nghiệp vụ nào có `USAGE` trên schema `ext`, nên **không ai gọi
@@ -469,7 +486,7 @@ nhất tới plaintext — nên đi vòng qua SQLi hay `psql` thẳng bằng m�
 bash scripts/verify.sh
 ```
 
-Chạy 145 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, **kết nối
+Chạy 157 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, **kết nối
 không TLS bị từ chối và cả ba client xác thực server bằng CA của lab**, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
@@ -492,7 +509,7 @@ replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, 
 PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
 đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 145    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 157    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -589,7 +606,7 @@ cd app && npm install && cp .env.example .env && npm run dev
 ## 7b. `analyzer/` — lớp 3
 
 Đọc `logs/*.json`, bám `session_id` để quy trách nhiệm cho đúng nhân viên theo
-`SET ROLE`, áp 11 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
+`SET ROLE`, áp 12 rule trên log pgAudit (cộng 2 rule tầng web), ghi cảnh báo vào `audit.alerts` bằng
 `analyzer_user` (chỉ `INSERT`).
 
 Chạy sẵn trong Docker ở chế độ `--watch` (service `analyzer`): mọi hành vi
@@ -628,6 +645,12 @@ bash backup/scripts/demo_pitr.sh                                  # kịch bản
 | `demo_pitr.sh` | Ghi mốc T → `app_user` thử `DELETE` (lớp 1 chặn) → superuser xóa nhầm toàn bộ `orders`/`payments` → PITR về T → so khớp số dòng và tổng tiền. |
 | `_restore_inner.sh` | Phần chạy **bên trong** container (`pitr-restore` hoặc `pitr-sandbox` trong `docker-compose.yml`, profile `tools`). Không gọi trực tiếp. |
 | `lib.sh` | Hàm dùng chung: chọn base backup, flush WAL, đọc timeline. |
+
+**RTO/RPO thực đo.** `pitr_restore.sh` in thời gian từng bước; `demo_pitr.sh`
+ghi kết quả kèm điều kiện đo ra [`docs/recovery-results.md`](docs/recovery-results.md).
+Lần đo ngày 2026-10-13: RTO 11,2 giây (database nhận kết nối trở lại), mất 0
+dòng so với mốc T. Đó là trường hợp máy chủ và kho WAL còn nguyên; mất cả máy
+chủ thì RPO bị chặn bởi `archive_timeout = 60s` — con số cấu hình, chưa đo.
 
 ### Mã hóa bản sao lưu
 
@@ -704,12 +727,17 @@ bash scripts/benchmark.sh     # ~2-3 phút, ghi docs/benchmark-results.md
 Đo từng cặp có/không cơ chế bằng `pgbench`. Kết quả chính (phân tích đầy đủ ở
 [`docs/performance.md`](docs/performance.md)):
 
-| Cơ chế | Chi phí |
+| Cơ chế | Chi phí (đo ngày 2026-10-13, `docs/benchmark-results.md`) |
 |---|---|
-| RLS | ~0,1 ms/câu lệnh (+12–31%), không tăng theo số dòng |
-| Giải mã CCCD | ~1,4 ms **mỗi bản ghi** — chỉ giải mã dòng đang hiển thị |
-| Blind index so với giải mã để tìm | 2,7 ms so với 2 777 ms (×1 000) |
-| pgAudit | ×3 latency, ~5,5 KB log mỗi giao dịch |
+| RLS | ~0,07–0,08 ms/câu lệnh (+19–38%), không tăng theo số dòng |
+| Giải mã CCCD | ~1,1 ms **mỗi bản ghi**, đã gồm chốt token phiên — chỉ giải mã dòng đang hiển thị |
+| Blind index so với giải mã để tìm | 1,7 ms so với 1 968 ms (×1 100) |
+| pgAudit | ×22 latency trên máy đo này (0,34 → 7,4 ms), ~8,7 KB log mỗi giao dịch |
+
+Số tuyệt đối phụ thuộc máy — lần đo ngày 2026-10-07 trên máy khác cho pgAudit
+×6 với cùng ~8,7 KB log mỗi giao dịch, tức khác biệt nằm ở tốc độ ghi log của
+máy chứ không ở lượng log. `docs/performance.md` là phân tích viết tay theo
+các lần đo trước, số trong đó có thể lệch với bảng này.
 
 Chính việc đo đã tìm ra một lỗi hiệu năng trong policy RLS (hàm bị gọi lại cho
 từng dòng, chậm ×12) mà không phép thử chức năng nào bắt được — xem mục 1 của
@@ -803,6 +831,30 @@ lỗi bị bỏ sót.
 - SQLi ở `/customers/search` vẫn đọc được các cột không nhạy cảm của
   `app.staff` (`username`, `db_user`). Phân quyền và RLS không thay thế được
   parameterized query.
+- **Nhiều câu lệnh trong một chuỗi truy vấn ở `/customers/search`.** Endpoint
+  này gọi `query(sql)` không tham số, nên node-pg gửi bằng giao thức *simple
+  query* — giao thức cho phép một chuỗi chứa nhiều câu lệnh. Bản review của
+  nhóm báo cáo rằng nhờ đó SQLi có thể sửa dữ liệu trong phạm vi chi nhánh của
+  chính người gửi và giữ được thay đổi dù app trả 500 rồi `ROLLBACK`. **Lab
+  chưa tái hiện được kết quả đó** (lần thử qua HTTP dừng ở lỗi cú pháp tại
+  database), nên ở đây chỉ ghi nhận như một rủi ro được báo cáo, chưa có số
+  liệu thực nghiệm.
+  - Điều chắc chắn: phân quyền và RLS **không** ngăn một nhân viên sửa dữ liệu
+    của chính chi nhánh mình — đó là quyền hợp lệ của họ. Lớp CSDL chỉ giữ
+    được ranh giới chi nhánh; chỉ truy vấn tham số hóa mới loại bỏ được nguyên
+    nhân.
+  - Lớp 3 có rule `SQLI_STACKED` nhận diện chuỗi nhiều câu lệnh trong log
+    pgAudit (`analyzer/README.md`). Rule mới được thử ở mức bộ tách câu và một
+    phép đối chứng báo nhầm trong `verify.sh`; **chưa có phép thử đầu-cuối**.
+  - Cách vá (cố ý chưa làm, endpoint này là lỗ hổng minh họa): tham số hóa
+    truy vấn; hoặc tối thiểu ép *extended query* (`queryMode: 'extended'` của
+    node-pg) để PostgreSQL từ chối chuỗi nhiều câu lệnh.
+- **`app.decrypt_text()` không gắn bản mã với chi nhánh.** Hàm chỉ nhận bản mã,
+  nên nhân viên **có token hợp lệ** vẫn giải mã được bản mã của chi nhánh khác
+  nếu lấy được nó từ nguồn ngoài database (bản sao lưu bị lộ cùng khóa sao lưu).
+  Chốt phiên (mục 4, "Vai phải đi kèm phiên đăng nhập", điểm 5) chỉ chặn phiên
+  không chứng minh được mình là nhân viên. Hướng làm: dẫn xuất khóa theo chi nhánh, hoặc gắn `branch_id` vào bản
+  rõ trước khi mã hóa rồi so lại lúc giải mã.
 - Token phiên nằm trong GUC của transaction, nên SQL Injection trong một request
   đọc được bằng `current_setting()` — nhưng đó là token của **chính người gửi
   request**, không thêm quyền gì. Token có hạn tuyệt đối 12 giờ (không gia hạn

@@ -14,10 +14,10 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 |-----|----------|-----------|
 | 1 | `pg_hba` + TLS bắt buộc + Role/GRANT + Row-Level Security | **Xong** (TLS 1.3, client verify-full) |
 | 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
-| 3 | `pgAudit` + analyzer tự viết | **Xong** (11 rule trên log pgAudit + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`; bản ghi mồi `HONEYTOKEN_ACCESS`) |
+| 3 | `pgAudit` + analyzer tự viết | **Xong** (12 rule trên log pgAudit, gồm `SQLI_STACKED` + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`; bản ghi mồi `HONEYTOKEN_ACCESS`) |
 | 4 | WAL archive + `pg_dump` + PITR, **mã hóa toàn bộ kho sao lưu** | **Xong** (`backup/scripts/`, `postgres/backup-crypt.sh`, thử khôi phục trong sandbox) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (145 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (157 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
@@ -312,6 +312,22 @@ app.blind_index(text)   -> bytea
     subshell làm mất danh sách thu hồi. `verify.sh`, `gen-alerts.sh`,
     `benchmark.sh` đều dùng nó; script mới `SET ROLE nv_*` mà quên token sẽ
     thấy 0 dòng và tưởng RLS hỏng.
+- **Role tự đăng nhập không cần token.** `app.branch_of()` trả chi nhánh ngay
+  khi `p_db_user = session_user` (`readonly_user` — có dòng trong `app.staff`,
+  không đi qua app nên không bao giờ có token). Đừng gỡ nhánh này "cho chặt":
+  thiếu nó `readonly_user` đọc ra 0 dòng và mỗi truy vấn hợp lệ ghi một dòng
+  LOG mạo danh (đã xảy ra). Cũng đừng đổi `session_user` thành `current_user`
+  — `current_user` đổi theo `SET ROLE`, tức là mở lại đúng lỗ token đang vá.
+- **Giải mã đòi cùng token đó.** `app.decrypt_text()` gọi
+  `app.assert_staff_session()` (`05_crypto.sql`); `app_user` không có `EXECUTE`
+  trên `decrypt_text`, chỉ `staff_role` có. Hàm chốt chạy BÊN TRONG hàm
+  `SECURITY DEFINER` nên lấy vai người gọi từ GUC `role` + `session_user`, không
+  từ `current_user` (là `db_owner`) — đừng "rút gọn" thành gọi
+  `app.current_branch_id()`, khi đó không ai giải mã được. Thân hàm chốt chỉ
+  dùng biểu thức đơn giản của plpgsql để không thêm dòng log lồng nhau nào cho
+  mỗi bản ghi; lỗi nó báo (`SECDB_DECRYPT_WITHOUT_SESSION`, SQLSTATE 42501) là
+  thứ `sessions.js` đọc để quy cảnh báo cho session user. Giới hạn còn lại: hàm
+  không gắn bản mã với chi nhánh (README mục 8).
 - Dùng **`SET LOCAL ROLE` trong transaction**, không dùng `SET ROLE` trần. Với
   connection pool, quên `RESET ROLE` là request sau mượn lại connection đó sẽ
   chạy dưới danh tính người trước — lỗ hổng nặng và chỉ xuất hiện khi pool tái
@@ -511,6 +527,12 @@ trước hook của pgAudit, nên log chỉ có dòng `ERROR` với `state_code 
 `sessions.js` bắt riêng dòng này (class `DENIED`, rule `ACCESS_DENIED`). Đừng bỏ
 — thiếu nó thì SQLi đọc `password_hash` (giờ bị chặn) biến mất khỏi lớp 3.
 
+**`SQLI_STACKED` tách câu bằng bộ đọc từ, không bằng regex**
+(`rules/sqlInjection.js`): dấu `;` trong chuỗi ký tự, tên nhảy kép, `$$...$$`
+hay chú thích không ngắt câu, và `\` chỉ là ký tự thoát trong `E'...'`. Rule mới
+chỉ có phép đối chứng báo nhầm trong `verify.sh`, chưa có phép thử đầu-cuối —
+đừng ghi vào tài liệu điều gì vượt quá mức đó.
+
 **`PRIVILEGE_ESCALATION` dựa vào class `role` + `ddl` trong `pgaudit.log`.**
 Gỡ hai class đó cho log gọn là lớp 3 mù trước kịch bản `admin_user` bị chiếm
 (tắt RLS, `GRANT ... TO PUBLIC`, hàm `SECURITY DEFINER` — đều là câu lệnh hợp
@@ -608,6 +630,10 @@ Xem mục 7c trong `README.md`. Phần dễ sai:
   `pitr_restore.sh` tạm dừng analyzer rồi ghi bù bằng `--replay-after=<thoi_diem
   lớn nhất còn lại>`. Đừng bỏ bước này: thiếu nó, cảnh báo về chính sự cố vừa
   khôi phục biến mất vĩnh viễn.
+- **RTO/RPO thực đo:** `pitr_restore.sh` in thời gian từng bước (hàm `phase`),
+  `demo_pitr.sh` ghi `docs/recovery-results.md`. Thêm bước mới vào
+  `pitr_restore.sh` thì mở nó bằng `phase "[n/N] ..."`, đừng `echo` trần — nếu
+  không thời gian của nó bị cộng vào bước trước.
 - **Dashboard không đọc DB khi `pg_is_in_recovery()`** — đang replay WAL thì DB
   vẫn cho đọc trạng thái dở dang; đọc trúng là đẩy hàng trăm cảnh báo cũ xuống
   trình duyệt như cảnh báo mới (đã tái hiện: 409). Kết nối lại xong thì luôn
@@ -619,7 +645,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 145 phép thử, phải đạt hết
+bash scripts/verify.sh         # 157 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

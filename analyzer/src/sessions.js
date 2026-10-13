@@ -90,6 +90,17 @@ const IDENTITY_RE = /^SECDB_IDENTITY_WITHOUT_SESSION role=([a-z][a-z0-9_]*) ly_d
 const IDENTITY_CONTEXT = 'PL/pgSQL function current_branch_id() ';
 const IMPERSONATION_REASONS = new Set(['khong_co_token', 'token_khong_ton_tai', 'token_cua_nguoi_khac']);
 
+// Cung bang chung do, den tu duong thu hai: chot phien cua viec giai ma
+// (app.assert_staff_session, 05_crypto.sql). Ke cam mat khau app_user va mot
+// ban ma lay tu nguon khac goi "SET ROLE nv_dn01; SELECT app.decrypt_text(...)"
+// - khong cham bang nao nen app.current_branch_id() khong chay, khong co dong
+// LOG o tren. Ham chot bao LOI 42501 voi cung khuon role=/ly_do=. Cung ba dieu
+// kien tin cay: context la dung ham do (khong role nghiep vu nao tao duoc ham
+// trung ten), role khop vai phien dang mang, va ham tu lay vai tu GUC/
+// session_user chu khong nhan qua tham so.
+const DECRYPT_DENIED_RE = /^SECDB_DECRYPT_WITHOUT_SESSION role=([a-z][a-z0-9_]*) ly_do=([a-z_]+)$/;
+const DECRYPT_DENIED_CONTEXT = 'PL/pgSQL function assert_staff_session() ';
+
 const DECRYPT_RE = /pgp_sym_decrypt/i;
 const ENCRYPT_RE = /pgp_sym_encrypt/i;
 
@@ -179,6 +190,15 @@ class SessionTracker {
     // UNION doc app.staff.password_hash (04_grants.sql chan o muc cot). Vai van
     // lay tu phien nhu moi cau lenh khac, nen quy duoc cho dung nv_xxx.
     if (record.error_severity === 'ERROR' && record.state_code === '42501') {
+      // Giai ma bi chot phien tu choi: danh dau vai mao danh TRUOC khi xa cau
+      // lenh dang gom - chinh cau do (da co dong AUDIT, vi loi xay ra giua
+      // chung) cung phai quy cho session user.
+      const denied = DECRYPT_DENIED_RE.exec(message);
+      const decryptDenied = Boolean(denied)
+        && String(record.context || '').startsWith(DECRYPT_DENIED_CONTEXT);
+      if (decryptDenied && denied[1] === session.role && IMPERSONATION_REASONS.has(denied[2])) {
+        session.unverifiedRole = denied[1];
+      }
       this.flushSession(session);
       const unverified = this.isUnverified(session, session.role);
       this.onStatement({
@@ -192,6 +212,7 @@ class SessionTracker {
         statement: record.statement || '',
         relations: [],
         deniedMessage: record.message || '',
+        decryptDenied,
       });
       return;
     }

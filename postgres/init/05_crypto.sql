@@ -101,8 +101,10 @@ GRANT EXECUTE ON FUNCTION ext.index_pepper() TO db_owner;
 -- db_owner, mà db_owner đang bị FORCE ROW LEVEL SECURITY chặn nên luôn đọc ra
 -- 0 dòng và hàm luôn trả NULL. Nhận ciphertext vào thì câu SELECT nằm ở phía
 -- người gọi, RLS áp đúng theo chi nhánh của họ.
--- (Ngoại lệ duy nhất: app.decrypt_text() tra audit.honeytokens qua hàm phụ
--- audit.is_honeytoken() - bảng đó KHÔNG bật RLS và thuộc db_owner, nên lần tra
+-- (Hai ngoại lệ, đều ở app.decrypt_text() và đều qua hàm phụ: tra
+-- audit.honeytokens bằng audit.is_honeytoken(), và kiểm tra token phiên bằng
+-- app.assert_staff_session() -> app.branch_of() đọc app.staff +
+-- app.staff_sessions. Ba bảng đó KHÔNG bật RLS và thuộc db_owner, nên lần tra
 -- chạy đúng dưới SECURITY DEFINER.)
 -- =============================================================================
 
@@ -208,6 +210,86 @@ $$;
 REVOKE ALL ON FUNCTION audit.is_honeytoken(bytea)      FROM PUBLIC;
 REVOKE ALL ON FUNCTION audit.honeytoken_tripped(text)  FROM PUBLIC;
 
+-- -----------------------------------------------------------------------------
+-- Chốt phiên cho việc giải mã.
+--
+-- app.decrypt_text() chỉ nhận ciphertext - nó không biết dòng đó của chi nhánh
+-- nào, nên tự nó là một "máy giải mã": ai gọi được hàm, đưa vào bản mã nào
+-- cũng ra bản rõ. RLS chặn việc ĐỌC bản mã từ bảng, nhưng không chặn bản mã lấy
+-- từ nguồn khác (bản sao lưu bị lộ cùng khóa sao lưu, một bản dump cũ...). Và
+-- EXECUTE cấp cho staff_role thì app_user chỉ cần SET ROLE nv_xxx là có - SET
+-- ROLE không đòi token (06_rls.sql).
+--
+-- Vì vậy giải mã đòi đúng thứ RLS đòi: phiên phải chứng minh được mình là một
+-- nhân viên đang đăng nhập. Không qua thì LỖI 42501 chứ không trả NULL: dòng
+-- ERROR đó là thứ analyzer đọc thành ACCESS_DENIED (pgAudit không ghi AUDIT cho
+-- câu bị từ chối) - lần thử giải mã lậu hiện ra ở lớp 3 thay vì im lặng.
+-- Luồng hợp lệ không bao giờ chạm lỗi này: thiếu token thì RLS đã trả 0 dòng,
+-- không có bản mã nào để đưa vào hàm.
+--
+-- BẪY SECURITY DEFINER (cùng họ với bẫy ở 06_rls.sql): hàm này chạy BÊN TRONG
+-- app.decrypt_text(), nên current_user ở đây là db_owner. Gọi
+-- app.current_branch_id() là luôn ra NULL và không ai giải mã được nữa. Vai
+-- của người gọi lấy từ hai thứ SECURITY DEFINER không đổi:
+--   - GUC `role`: giá trị SET ROLE của phiên ('none' nếu chưa SET ROLE). Không
+--     giả được - SET ROLE chỉ nhận role mà session user là thành viên, và bên
+--     trong hàm SECURITY DEFINER thì PostgreSQL cấm hẳn câu SET ROLE.
+--   - session_user: role đã xác thực của kết nối.
+-- rồi đưa cho app.branch_of() - cùng một phép kiểm tra token với policy RLS.
+--
+-- Superuser (GUC is_superuser = on, chỉ PostgreSQL tự đặt) được qua: đó là
+-- đường quản trị qua unix socket, vd. mã hóa lại toàn bộ khi xoay khóa.
+-- Superuser đã SET ROLE xuống vai khác thì is_superuser = off - db_owner vẫn
+-- không giải mã được, đúng với việc nó không đọc được dữ liệu (FORCE RLS).
+--
+-- Thông báo lỗi có khuôn cố định "SECDB_DECRYPT_WITHOUT_SESSION role=.. ly_do=.."
+-- (cùng kiểu với dòng LOG của app.current_branch_id). analyzer/src/sessions.js
+-- đọc nó để quy cảnh báo cho SESSION USER khi vai đang mang không có token -
+-- nhân viên bị mạo danh không làm gì cả. Analyzer chỉ tin dòng có `context`
+-- bắt đầu bằng "PL/pgSQL function assert_staff_session() ": khối DO tự RAISE
+-- cùng nội dung mang context "inline_code_block", và không role nghiệp vụ nào
+-- tạo được hàm trùng tên (không có CREATE ở schema nào, không có TEMP). Vai
+-- trong thông báo lấy từ GUC/session_user, không nhận từ tham số - nên đặt
+-- RAISE ở đây không lặp lại lỗi "ai cũng giả được tên role" của app.branch_of.
+--
+-- pgAudit: mọi biểu thức ở đây là biểu thức đơn giản của plpgsql (không qua
+-- executor), còn hai câu tra bảng nằm trong app.branch_of() - bị giấu với
+-- phiên app_user (BẪY 1). Nên mỗi lần giải mã vẫn để lại đúng MỘT dòng lồng
+-- nhau như trước; đừng viết lại thành `IF (SELECT ...)` hay `SELECT ... INTO`.
+--
+-- plpgsql nên thân hàm chỉ được phân giải lúc CHẠY: app.branch_of() tạo ở
+-- 06_rls.sql, sau file này.
+-- -----------------------------------------------------------------------------
+CREATE FUNCTION app.assert_staff_session() RETURNS boolean
+    LANGUAGE plpgsql
+    STABLE
+    SET search_path = app, pg_catalog
+AS $$
+DECLARE
+    v_role text := current_setting('role');
+    r      record;
+BEGIN
+    IF v_role = 'none' THEN
+        v_role := session_user;
+    END IF;
+    r := app.branch_of(v_role, current_setting('secdb.staff_token', true));
+    IF r.branch_id IS NOT NULL THEN
+        RETURN true;
+    END IF;
+    IF current_setting('is_superuser') = 'on' THEN
+        RETURN true;
+    END IF;
+    -- ly_do NULL: vai này không phải nhân viên (app_user chưa SET ROLE, db_owner).
+    RAISE EXCEPTION 'SECDB_DECRYPT_WITHOUT_SESSION role=% ly_do=%', v_role, coalesce(r.ly_do, 'khong_phai_nhan_vien')
+        USING ERRCODE = 'insufficient_privilege',
+              HINT = 'app.decrypt_text() chi giai ma cho phien mang token dang nhap con han cua dung nhan vien dang SET ROLE';
+END $$;
+
+REVOKE ALL ON FUNCTION app.assert_staff_session() FROM PUBLIC;
+
+-- Nhánh `WHEN NOT app.assert_staff_session()` không bao giờ đúng: không có
+-- phiên hợp lệ thì hàm đó tự báo lỗi. (Chú thích để ngoài thân hàm: pgAudit
+-- chép nguyên văn thân hàm vào log cho MỖI bản ghi được giải mã.)
 CREATE FUNCTION app.decrypt_text(p_cipher bytea) RETURNS text
     LANGUAGE sql
     STABLE
@@ -216,6 +298,7 @@ CREATE FUNCTION app.decrypt_text(p_cipher bytea) RETURNS text
 AS $$
     SELECT CASE
         WHEN p_cipher IS NULL THEN NULL
+        WHEN NOT app.assert_staff_session() THEN NULL
         WHEN audit.is_honeytoken(p_cipher)
             THEN audit.honeytoken_tripped(ext.pgp_sym_decrypt(p_cipher, ext.master_key()))
         ELSE ext.pgp_sym_decrypt(p_cipher, ext.master_key())
@@ -263,13 +346,19 @@ RESET ROLE;
 --
 -- Chỉ các role thao tác dữ liệu thật mới được gọi. readonly_user KHÔNG nằm
 -- trong danh sách: vai trò báo cáo không có lý do gì để đọc CCCD.
+--
+-- app.decrypt_text() CHỈ cấp cho staff_role, KHÔNG cấp cho app_user: app luôn
+-- SET LOCAL ROLE nv_xxx trước khi đọc dữ liệu, nên phiên app_user chưa SET
+-- ROLE không có lý do gì để giải mã. Đây chỉ là lớp ngoài - app_user SET ROLE
+-- sang nv_xxx là có lại quyền này; thứ chặn thật là app.assert_staff_session()
+-- bên trong hàm (đòi token phiên).
 -- =============================================================================
 REVOKE ALL ON FUNCTION app.encrypt_text(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.decrypt_text(bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.blind_index(text)  FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION app.encrypt_text(text)  TO app_user, staff_role;
-GRANT EXECUTE ON FUNCTION app.decrypt_text(bytea) TO app_user, staff_role;
+GRANT EXECUTE ON FUNCTION app.decrypt_text(bytea) TO staff_role;
 GRANT EXECUTE ON FUNCTION app.blind_index(text)   TO app_user, staff_role;
 
 -- =============================================================================

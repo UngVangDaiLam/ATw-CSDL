@@ -22,6 +22,22 @@ module.exports = {
   run(stmt, config) {
     if (stmt.class !== 'DENIED') return null;
 
+    // Chot phien cua app.decrypt_text() tu choi (05_crypto.sql). Luong hop le
+    // khong bao gio toi day: thieu token thi RLS da tra 0 dong, khong co ban ma
+    // nao de dua vao ham. Ai cham chot nay la dang cam ban ma lay tu NGUON KHAC
+    // (ban sao luu, ban dump) - chi con thieu dung buoc giai ma.
+    // decryptDenied do sessions.js dat sau khi kiem tra context cua dong loi.
+    if (stmt.decryptDenied) {
+      return {
+        rule: 'ACCESS_DENIED',
+        risk: 90,
+        detail: {
+          mo_ta: 'Thu giai ma khi phien khong co token dang nhap nhan vien hop le - ban ma duoc dua tu ngoai vao, khong doc tu bang',
+          loi: String(stmt.deniedMessage || '').slice(0, 200),
+        },
+      };
+    }
+
     const credTable = config.credentialTable.split('.').pop();
     const credential =
       CREDENTIAL_RE.test(stmt.statement) ||

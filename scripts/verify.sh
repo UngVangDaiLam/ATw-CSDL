@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.." || exit 1
 set -a; . ./.env; set +a
 : "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chua co trong .env - them vao (xem .env.example)}"
 : "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD chua co trong .env - them vao (xem .env.example)}"
-: "${DEV_PASSWORD:?DEV_PASSWORD chua co trong .env - them vao (xem .env.example) roi chay scripts/reset.sh}"
+: "${DEV_PASSWORD:?DEV_PASSWORD chua co trong .env - chay bash scripts/reset.sh (tu bo sung bien moi vao .env)}"
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
 PASS=0; FAIL=0

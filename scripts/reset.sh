@@ -43,6 +43,12 @@ find backup/wal_archive backup/full logs analyzer/state -type f ! -name '.gitkee
 # full_backup.sh tạo mỗi lần một thư mục con - xóa file xong còn vỏ rỗng.
 find backup/full -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
+# .env từ trước một lần pull có thể thiếu biến mới (vd. DEV_PASSWORD) -> 02_roles.sh
+# dừng ngay khi init. Bổ sung ở đây, đúng lúc database sắp được tạo lại, nên
+# role mới nhận đúng mật khẩu vừa sinh. Giá trị đã có thì không đụng tới.
+echo "==> Bao dam .env du bien (chi bo sung bien moi, khong ghi de)"
+bash scripts/ensure-env.sh
+
 echo "==> Bao dam da co khoa ma hoa (khong ghi de neu da ton tai)"
 bash scripts/init-secrets.sh
 

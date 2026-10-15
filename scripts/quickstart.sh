@@ -10,10 +10,10 @@
 #
 # Làm lần lượt:
 #   1. Kiểm tra Docker đang chạy.
-#   2. Chưa có .env -> sinh từ .env.example, thay mọi mật khẩu mẫu bằng chuỗi
-#      ngẫu nhiên. Đã có .env thì GIỮ NGUYÊN.
+#   2. scripts/ensure-env.sh: chưa có .env -> sinh từ .env.example với mật khẩu
+#      ngẫu nhiên; đã có -> giữ nguyên, chỉ bổ sung biến mới (vd. DEV_PASSWORD).
 #   3. scripts/reset.sh  (dọn volume/WAL/log, sinh secrets/, build, chờ init xong)
-#   4. scripts/verify.sh (157 phép thử)
+#   4. scripts/verify.sh (170 phép thử)
 #   5. In địa chỉ app/dashboard và tài khoản demo.
 #
 # Không cần cài Node trên máy: app, analyzer, dashboard đều chạy trong Docker.
@@ -44,26 +44,7 @@ echo "  Docker OK"
 
 # -----------------------------------------------------------------------------
 step "2/4 Chuan bi .env"
-if [ -f .env ]; then
-    echo "  .env da co - giu nguyen"
-else
-    [ -f .env.example ] || die "Khong tim thay .env.example."
-    # Hex: không có ký tự đặc biệt nên an toàn trong URL kết nối postgresql://
-    # mà verify.sh và các script khác tự ghép.
-    rand_pw() {
-        if command -v openssl >/dev/null 2>&1; then openssl rand -hex 16
-        else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
-    }
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
-        case "$line" in
-            *=doi_mat_khau_nay_*) printf '%s=%s\n' "${line%%=*}" "$(rand_pw)" ;;
-            *)                    printf '%s\n' "$line" ;;
-        esac
-    done < .env.example > .env
-    chmod 600 .env 2>/dev/null || true
-    echo "  Da tao .env voi mat khau ngau nhien (xem trong file .env neu can)"
-fi
+bash scripts/ensure-env.sh || die "Khong chuan bi duoc .env."
 
 # -----------------------------------------------------------------------------
 step "3/4 Dung lab tu so 0 (mat 2-5 phut, lan dau build lau hon)"

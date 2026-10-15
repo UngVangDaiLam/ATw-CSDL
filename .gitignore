@@ -49,5 +49,6 @@ analyzer/state/*
 app/public/
 
 #Thuyet trinh
-Kich_ban.pdf
-Thuyet_trinh.pptx
+*.pdf
+*.pptx
+*.docx

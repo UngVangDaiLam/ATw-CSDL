@@ -12,7 +12,7 @@ Môi trường lab chạy local bằng Docker Compose, minh họa 4 lớp bảo 
 Stack: PostgreSQL 16 · Node.js + Express · Node.js (analyzer) · React + Socket.IO
 
 Chạy thử: `bash scripts/quickstart.sh` (hoặc bấm đúp `quickstart.bat`) — một lệnh
-dựng lab và chạy 157 phép thử nghiệm thu. Chi tiết ở mục 2.
+dựng lab và chạy 170 phép thử nghiệm thu. Chi tiết ở mục 2.
 
 ---
 
@@ -67,11 +67,12 @@ Oracle / SQL Server / AWS, kể cả những chỗ lab thua:
 │       ├── 04_grants.sql
 │       ├── 05_crypto.sql   # hàm mã hóa, khóa đọc từ Docker secret
 │       ├── 06_rls.sql      # policy phân tách theo chi nhánh
-│       └── 07_seed.sql
+│       ├── 07_seed.sql
+│       └── 08_dev_mask.sql # bản sao ĐÃ CHE cho môi trường phát triển (schema dev)
 ├── secrets/                # KHÔNG commit - sinh bằng scripts/init-secrets.sh
 ├── scripts/
 │   ├── init-secrets.sh     # sinh khóa mã hóa + pepper
-│   ├── verify.sh           # chạy toàn bộ 157 phép thử nghiệm thu
+│   ├── verify.sh           # chạy toàn bộ 170 phép thử nghiệm thu
 │   ├── demo-attack.sh      # demo tấn công qua app -> lớp nào chặn, lớp nào ghi nhận
 │   ├── gen-alerts.sh       # diễn lại hành vi xấu + chạy analyzer -> cảnh báo thật cho dashboard
 │   ├── benchmark.sh        # đo chi phí từng lớp bảo mật -> docs/benchmark-results.md
@@ -81,7 +82,7 @@ Oracle / SQL Server / AWS, kể cả những chỗ lab thua:
 ├── backup/
 │   ├── full/               # bản sao lưu đầy đủ (pg_basebackup / pg_dump), đã mã hóa .gpg
 │   ├── wal_archive/        # đích của archive_command (từng segment đã mã hóa)
-│   └── scripts/            # full_backup.sh, pitr_restore.sh, demo_pitr.sh - xem mục 7c
+│   └── scripts/            # full_backup.sh, pitr_restore.sh, demo_pitr.sh, measure_rto_rpo.sh - xem mục 7c
 ├── logs/                   # log csv + json của PostgreSQL, nguồn cho analyzer
 ├── docs/
 │   ├── threat-model.md     # STRIDE cho app/, ranh giới tin cậy app <-> DB
@@ -214,6 +215,9 @@ psql "postgresql://admin_user@localhost:15432/secdb"
 
 # db_owner: chủ sở hữu schema app/audit
 psql "postgresql://db_owner@localhost:15432/secdb"
+
+# dev_user: lập trình viên - chỉ SELECT schema dev (bản sao đã che), không chạm app.*
+psql "postgresql://dev_user@localhost:15432/secdb"
 ```
 
 Kiểm tra mình đang nói chuyện với đúng server:
@@ -480,13 +484,43 @@ nhất tới plaintext — nên đi vòng qua SQLi hay `psql` thẳng bằng m�
 > `pgp_sym_encrypt` gắn chặt với khóa: sinh khóa mới thì `cccd`, `card_token`
 > cũ không giải mã được nữa. Đổi khóa phải đi kèm `scripts/reset.sh`.
 
+### Che dữ liệu cho môi trường phát triển (schema `dev`)
+
+Lập trình viên cần dữ liệu "trông như thật" để viết và thử truy vấn, không cần
+biết khách hàng là ai. `08_dev_mask.sql` đổ một bản sao **đã che** của `app`
+sang schema `dev`; role `dev_user` chỉ có `SELECT` trên `dev`, **không có
+`USAGE` trên `app`, `audit`, `ext`** — không đọc được bản gốc, không gọi được
+hàm giải mã.
+
+| Trường | Cách xử lý | Ví dụ |
+|---|---|---|
+| `full_name` | chữ cái đầu mỗi từ | `Khach Hang 02` → `K. H. 0***` |
+| `phone` | giữ 3 số đầu + 2 số cuối | `0901000002` → `090*****02` |
+| `email` | giữ ký tự đầu + tên miền | `kh02@example.local` → `k***@example.local` |
+| `cccd`, `cccd_hash`, `card_token` | **loại bỏ** (NULL, có `CHECK (... IS NULL)` — superuser chép nhầm cũng bị chặn) | — |
+| `staff.username`, `password_hash`, `db_user` | **không có cột** trong `dev.staff` | — |
+| `card_last4`, id, chi nhánh, số tiền, trạng thái, thời điểm | giữ nguyên (cần cho JOIN, thống kê; không định danh ai) | — |
+
+Che **tĩnh** (sao sẵn) chứ không dùng view che động trên `app`: view chạy dưới
+quyền chủ sở hữu `db_owner` — bị `FORCE RLS` nên ra 0 dòng — và bắt `dev_user`
+phải chạm đường dẫn tới bản gốc. Làm mới khi dữ liệu thật đổi:
+
+```bash
+docker compose exec postgres psql -U postgres -d secdb -c 'CALL dev.refresh_masked();'
+```
+
+Thủ tục tự từ chối mọi role không phải superuser (role khác bị RLS lọc nên sẽ
+xóa trắng bản sao mà không báo lỗi). Giới hạn: đây là **giảm mức lộ, không phải
+ẩn danh hóa** — tổ hợp chi nhánh + thời điểm + số tiền vẫn có thể giúp người đã
+biết sẵn một khách hàng nhận ra họ. Phép thử: mục "LOP 2b" của `verify.sh`.
+
 ## 5. Nghiệm thu
 
 ```bash
 bash scripts/verify.sh
 ```
 
-Chạy 157 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, **kết nối
+Chạy 170 phép thử trên cả 4 lớp: `pg_hba` chặn superuser qua TCP, **kết nối
 không TLS bị từ chối và cả ba client xác thực server bằng CA của lab**, `app_user` bị
 từ chối DELETE/DROP/TRUNCATE/CREATE và schema `audit`, `readonly_user` không
 đọc được `payments`, RLS phân tách đúng chi nhánh theo cả chiều đọc lẫn chiều
@@ -509,7 +543,7 @@ replication qua TCP bị `pg_hba` từ chối, bản `pg_dump` đọc được, 
 PITR thật trong container sandbox** dừng đúng tại thời điểm chỉ định (không
 đụng tới database đang chạy).
 
-Kết quả mong đợi: `DAT: 157    TRUOT: 0`.
+Kết quả mong đợi: `DAT: 170    TRUOT: 0`.
 
 ## 6. Ghi chú vận hành
 
@@ -642,6 +676,7 @@ bash backup/scripts/demo_pitr.sh                                  # kịch bản
 |------|------|
 | `full_backup.sh` | Tạo `backup/full/<YYYYMMDD_HHMMSS>/`: `base.tar.gz.gpg` + `pg_wal.tar.gz.gpg` + `backup_manifest` (pg_basebackup, bản vật lý — điểm xuất phát của PITR), `secdb.dump.gpg` (pg_dump -Fc, bản logic), `backup_info` (thời điểm hoàn tất). |
 | `pitr_restore.sh` | Đẩy WAL còn lại ra archive → dừng postgres → cất data hiện tại (mã hóa) vào `backup/full/pre_pitr_*.tar.gz.gpg` → giải mã và giải nén base backup mới nhất hoàn tất *trước* thời điểm đích → `pg_verifybackup` → replay WAL tới `recovery_target_time` → promote sang timeline mới → dọn cấu hình recovery → analyzer ghi bù cảnh báo bị quay lui (xem dưới). Tạm dừng service `analyzer` suốt quá trình. |
+| `measure_rto_rpo.sh` | Đo RTO/RPO lặp nhiều lần (`--runs N`) cho 3 kịch bản: xóa nhầm → PITR, **mất máy chủ** (lấy mẫu kho WAL khi có tải ghi), khôi phục `pg_dump` vào database mới. Ghi `docs/rto-rpo-results.md`. **Thật sự xóa rồi PITR** như `demo_pitr.sh`. |
 | `demo_pitr.sh` | Ghi mốc T → `app_user` thử `DELETE` (lớp 1 chặn) → superuser xóa nhầm toàn bộ `orders`/`payments` → PITR về T → so khớp số dòng và tổng tiền. |
 | `_restore_inner.sh` | Phần chạy **bên trong** container (`pitr-restore` hoặc `pitr-sandbox` trong `docker-compose.yml`, profile `tools`). Không gọi trực tiếp. |
 | `lib.sh` | Hàm dùng chung: chọn base backup, flush WAL, đọc timeline. |
@@ -649,8 +684,17 @@ bash backup/scripts/demo_pitr.sh                                  # kịch bản
 **RTO/RPO thực đo.** `pitr_restore.sh` in thời gian từng bước; `demo_pitr.sh`
 ghi kết quả kèm điều kiện đo ra [`docs/recovery-results.md`](docs/recovery-results.md).
 Lần đo ngày 2026-10-13: RTO 11,2 giây (database nhận kết nối trở lại), mất 0
-dòng so với mốc T. Đó là trường hợp máy chủ và kho WAL còn nguyên; mất cả máy
-chủ thì RPO bị chặn bởi `archive_timeout = 60s` — con số cấu hình, chưa đo.
+dòng so với mốc T. Đó là trường hợp máy chủ và kho WAL còn nguyên.
+
+`measure_rto_rpo.sh` đo lặp và bổ sung hai kịch bản còn thiếu
+([`docs/rto-rpo-results.md`](docs/rto-rpo-results.md), ngày 2026-10-15, có tải
+ghi 5 giao dịch/giây):
+
+| Kịch bản | Kết quả |
+|---|---|
+| Xóa nhầm → PITR, 3 lần | RTO 16,3 / 17,0 / 17,2 s (tính cả bước kiểm tra trước khi khôi phục); **0** giao dịch trước mốc bị mất; dừng cách mốc ≤ 112 ms; mọi giao dịch sau mốc (~22 s, ~97 giao dịch) bị quay lui theo thiết kế |
+| Mất máy chủ, chỉ còn kho WAL (90 mẫu / 300 s) | RPO trung vị 29 s, p95 58,1 s, **max 60,9 s** — đúng `archive_timeout = 60s` + ~1 s mã hóa segment. Kho đang nằm cùng máy, nên con số này chỉ đúng khi kho được đặt ở nơi khác |
+| Khôi phục `pg_dump` vào database mới | 1,4 s, đủ số dòng, giải mã được CCCD (cùng khóa) |
 
 ### Mã hóa bản sao lưu
 

@@ -15,6 +15,7 @@ cd "$(dirname "$0")/.." || exit 1
 set -a; . ./.env; set +a
 : "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chua co trong .env - them vao (xem .env.example)}"
 : "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD chua co trong .env - them vao (xem .env.example)}"
+: "${DEV_PASSWORD:?DEV_PASSWORD chua co trong .env - them vao (xem .env.example) roi chay scripts/reset.sh}"
 
 APP_URL="postgresql://app_user:${APP_USER_PASSWORD}@172.28.0.10:5432/secdb"
 PASS=0; FAIL=0
@@ -45,6 +46,8 @@ sql_db() { docker compose exec -T postgres psql "postgresql://dashboard_user:${D
 # psql dưới quyền readonly_user (TCP) - role TỰ ĐĂNG NHẬP, không qua app nên
 # không có token phiên; RLS nhận nó qua session_user (06_rls.sql, app.branch_of)
 sql_ro() { docker compose exec -T postgres psql "postgresql://readonly_user:${READONLY_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
+# psql dưới quyền dev_user (TCP) - lớp 2b, chỉ SELECT schema dev (bản sao đã che)
+sql_dev() { docker compose exec -T postgres psql "postgresql://dev_user:${DEV_PASSWORD}@172.28.0.10:5432/secdb" -tAc "$1" 2>&1; }
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mDAT  \033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mTRUOT\033[0m %s\n' "$1"; printf '        mong doi: %s\n        nhan duoc: %s\n' "$2" "$3"; }
@@ -233,6 +236,40 @@ rm -f "$DUMP"
 if [ -s secrets/pgcrypto_key ] && grep -rqF "$(cat secrets/pgcrypto_key)" logs/ 2>/dev/null; then
     bad "khoa KHONG xuat hien trong log" "khong co" "tim thay trong logs/"
 else ok "khoa KHONG xuat hien trong log"; fi
+
+# -----------------------------------------------------------------------------
+section "LOP 2b - Che du lieu cho moi truong phat trien (schema dev, dev_user)"
+# Ban sao DA CHE cua app.* (08_dev_mask.sql). dev_user chi doc duoc dev.*,
+# khong cham duoc ban goc, khong goi duoc ham giai ma.
+expect_eq "ban sao dev du so khach hang nhu ban goc" \
+       "$(sql_su 'SELECT count(*) FROM app.customers;')" "$(sql_dev 'SELECT count(*) FROM dev.customers;')"
+expect_eq "ban sao dev du so don hang va thanh toan nhu ban goc" \
+       "$(sql_su 'SELECT (SELECT count(*) FROM app.orders) || chr(124) || (SELECT count(*) FROM app.payments);')" \
+       "$(sql_dev 'SELECT (SELECT count(*) FROM dev.orders) || chr(124) || (SELECT count(*) FROM dev.payments);')"
+# PHAN A cua seed: id 2 = 'Khach Hang 02', 0901000002, kh02@example.local
+expect_eq "ten, dien thoai, email da che theo quy tac (khach id 2)" "K.H.0***|090*****02|k***@example.local" \
+       "$(sql_dev 'SELECT full_name || chr(124) || phone || chr(124) || email FROM dev.customers WHERE id = 2;')"
+expect_eq "KHONG dong nao con trung ten/dien thoai/email voi ban goc" "0" \
+       "$(sql_su 'SELECT count(*) FROM dev.customers d JOIN app.customers a USING (id) WHERE d.full_name = a.full_name OR d.phone = a.phone OR d.email = a.email;')"
+expect_eq "CCCD, blind index va so the da bi loai bo (NULL) trong ban sao" "0" \
+       "$(sql_dev 'SELECT (SELECT count(*) FROM dev.customers WHERE cccd IS NOT NULL OR cccd_hash IS NOT NULL) + (SELECT count(*) FROM dev.payments WHERE card_token IS NOT NULL);')"
+expect "chep nham ciphertext sang dev bi CHECK chan (ke ca superuser)" "violates check constraint" \
+       "$(sql_su 'BEGIN; UPDATE dev.customers d SET cccd = a.cccd FROM app.customers a WHERE a.id = d.id AND d.id = 1; ROLLBACK;')"
+expect "dev.staff khong co cot password_hash" "does not exist" \
+       "$(sql_dev 'SELECT password_hash FROM dev.staff;')"
+expect "dev_user KHONG doc duoc ban goc app.customers" "permission denied for schema app" \
+       "$(sql_dev 'SELECT count(*) FROM app.customers;')"
+expect "dev_user KHONG goi duoc ham giai ma" "permission denied for schema app" \
+       "$(sql_dev "SELECT app.decrypt_text('\\x00'::bytea);")"
+expect "dev_user KHONG cham duoc schema audit" "permission denied for schema audit" \
+       "$(sql_dev 'SELECT count(*) FROM audit.alerts;')"
+expect "dev_user KHONG ghi duoc vao ban sao" "permission denied for table customers" \
+       "$(sql_dev "BEGIN READ WRITE; UPDATE dev.customers SET phone = 'x' WHERE id = 1; ROLLBACK;")"
+# Chi superuser lam moi duoc: role khac bi RLS loc -> ban sao se rong ma khong bao loi.
+expect "db_owner KHONG lam moi duoc ban sao (tranh xoa trang trong im lang)" "chi chay duoc bang superuser" \
+       "$(sql_su 'SET ROLE db_owner; CALL dev.refresh_masked();')"
+expect_eq "dump cua ban sao dev KHONG chua so dien thoai/email that" "0" \
+       "$(docker compose exec -T postgres pg_dump -U postgres -d "$POSTGRES_DB" -n dev 2>/dev/null | grep -cE '0901000002|kh02@example\.local')"
 
 # -----------------------------------------------------------------------------
 section "LOP 1e - app.staff: khong role nghiep vu nao doc duoc password_hash"

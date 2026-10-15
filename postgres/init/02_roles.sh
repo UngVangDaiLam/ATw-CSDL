@@ -20,6 +20,7 @@ set -Eeuo pipefail
 : "${ADMIN_PASSWORD:?ADMIN_PASSWORD chưa được set trong .env}"
 : "${ANALYZER_PASSWORD:?ANALYZER_PASSWORD chưa được set trong .env}"
 : "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD chưa được set trong .env}"
+: "${DEV_PASSWORD:?DEV_PASSWORD chưa được set trong .env (xem .env.example)}"
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" \
@@ -30,7 +31,8 @@ psql -v ON_ERROR_STOP=1 \
      -v ro_pw="$READONLY_PASSWORD" \
      -v admin_pw="$ADMIN_PASSWORD" \
      -v analyzer_pw="$ANALYZER_PASSWORD" \
-     -v dashboard_pw="$DASHBOARD_PASSWORD" <<-'EOSQL'
+     -v dashboard_pw="$DASHBOARD_PASSWORD" \
+     -v dev_pw="$DEV_PASSWORD" <<-'EOSQL'
 
     -- =========================================================================
     -- ROLE SỞ HỮU
@@ -130,6 +132,19 @@ psql -v ON_ERROR_STOP=1 \
     --   - policy RLS lọc được theo chi nhánh của người đó
     --   - pgAudit ghi đúng ai làm gì (điều kiện sống còn cho analyzer ở lớp 3)
     -- =========================================================================
+    -- =========================================================================
+    -- ROLE PHÁT TRIỂN - LỚP 2, dữ liệu đã che
+    --
+    -- Dành cho lập trình viên / môi trường kiểm thử. CHỈ đọc schema `dev` - bản
+    -- sao đã che của dữ liệu thật (03_schema.sql, 08_dev_mask.sql). Không có
+    -- USAGE trên `app`, `audit`, `ext`: không đọc được bản gốc, không gọi được
+    -- app.decrypt_text(), không thấy cảnh báo.
+    -- =========================================================================
+    CREATE ROLE dev_user
+        LOGIN PASSWORD :'dev_pw'
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+        CONNECTION LIMIT 5;
+
     CREATE ROLE staff_role NOLOGIN;
 
     CREATE ROLE nv_hn01  NOLOGIN IN ROLE staff_role;   -- chi nhánh Hà Nội
@@ -152,9 +167,11 @@ psql -v ON_ERROR_STOP=1 \
     -- audit : bảng cảnh báo do analyzer ghi. Để RIÊNG schema nhằm đảm bảo
     --         app_user (nếu bị chiếm) không đọc/sửa/xóa được bằng chứng.
     -- ext   : extension (đã tạo ở 01)
+    -- dev   : bản sao đã che cho môi trường phát triển (chỉ dev_user đọc)
     -- =========================================================================
     CREATE SCHEMA app   AUTHORIZATION db_owner;
     CREATE SCHEMA audit AUTHORIZATION db_owner;
+    CREATE SCHEMA dev   AUTHORIZATION db_owner;
 
     -- =========================================================================
     -- QUYỀN Ở MỨC DATABASE
@@ -162,7 +179,7 @@ psql -v ON_ERROR_STOP=1 \
     -- đích danh: role lạ (hoặc role tạo nhầm) sẽ không connect được.
     -- =========================================================================
     REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user, analyzer_user, dashboard_user;
+    GRANT CONNECT ON DATABASE :"dbname" TO db_owner, app_user, readonly_user, admin_user, analyzer_user, dashboard_user, dev_user;
 
     -- =========================================================================
     -- THAM SỐ MẶC ĐỊNH THEO ROLE
@@ -200,6 +217,12 @@ psql -v ON_ERROR_STOP=1 \
     ALTER ROLE dashboard_user SET statement_timeout = '5s';
     ALTER ROLE dashboard_user SET application_name = 'secdb-dashboard';
 
+    -- Chỉ đọc ở mức phiên, chồng lên việc chỉ có SELECT ở 04_grants.sql.
+    ALTER ROLE dev_user SET search_path = dev;
+    ALTER ROLE dev_user SET default_transaction_read_only = on;
+    ALTER ROLE dev_user SET statement_timeout = '30s';
+    ALTER ROLE dev_user SET application_name = 'secdb-dev';
+
 EOSQL
 
-echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user / analyzer_user / dashboard_user"
+echo "02_roles.sh: da tao db_owner / app_user / readonly_user / admin_user / analyzer_user / dashboard_user / dev_user"

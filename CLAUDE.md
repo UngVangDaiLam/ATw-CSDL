@@ -13,15 +13,15 @@ minh họa và đo đạc được 4 lớp bảo vệ, nên mọi thay đổi ph
 | Lớp | Nội dung | Trạng thái |
 |-----|----------|-----------|
 | 1 | `pg_hba` + TLS bắt buộc + Role/GRANT + Row-Level Security | **Xong** (TLS 1.3, client verify-full) |
-| 2 | Mã hóa cột bằng `pgcrypto` | **Xong** (khóa qua Docker secret) |
+| 2 | Mã hóa cột bằng `pgcrypto` + che dữ liệu cho môi trường phát triển | **Xong** (khóa qua Docker secret; bản sao đã che `dev.*`, `dev_user`) |
 | 3 | `pgAudit` + analyzer tự viết | **Xong** (12 rule trên log pgAudit, gồm `SQLI_STACKED` + 2 rule tầng web, ghi `audit.alerts` bằng `analyzer_user`; bản ghi mồi `HONEYTOKEN_ACCESS`) |
-| 4 | WAL archive + `pg_dump` + PITR, **mã hóa toàn bộ kho sao lưu** | **Xong** (`backup/scripts/`, `postgres/backup-crypt.sh`, thử khôi phục trong sandbox) |
+| 4 | WAL archive + `pg_dump` + PITR, **mã hóa toàn bộ kho sao lưu** | **Xong** (`backup/scripts/`, `postgres/backup-crypt.sh`, thử khôi phục trong sandbox; đo RTO/RPO: `demo_pitr.sh` 1 lần, `measure_rto_rpo.sh` nhiều lần + mất máy chủ + pg_dump) |
 
-Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (157 phép thử, phải đạt hết).
+Nghiệm thu bằng một lệnh: `bash scripts/verify.sh` (170 phép thử, phải đạt hết).
 Dựng lại từ số 0: `bash scripts/reset.sh`.
 
 Thứ tự file init: `01_extensions` → `02_roles` → `03_schema` → `04_grants` →
-`05_crypto` → `06_rls` → `07_seed`.
+`05_crypto` → `06_rls` → `07_seed` → `08_dev_mask`.
 
 Stack: PostgreSQL 16 · Node.js + Express (`app/`) · Node.js (`analyzer/`) ·
 React + Vite + Socket.IO (`dashboard/`). Cả ba đều đã có code — xem README
@@ -224,6 +224,24 @@ dữ liệu, nhờ vậy số đo hiệu năng giữa các lần chạy mới so
 - `ext` — `pgcrypto`. Để riêng vì `PUBLIC` có `USAGE` mặc định trên `public`;
   đặt pgcrypto ở đó thì mọi role đều gọi được `pgp_sym_decrypt()`. Gọi hàm phải
   qualify `ext.` (hoặc dựa vào `search_path` đã set sẵn cho `app_user`).
+- `dev` — bản sao **đã che** của `app` cho môi trường phát triển (bảng ở
+  `03_schema.sql`, đổ dữ liệu ở `08_dev_mask.sql`). Chỉ `dev_user` đọc được,
+  **chỉ `SELECT`**; `dev_user` không có `USAGE` trên `app`/`audit`/`ext`.
+  - Làm mới bằng `CALL dev.refresh_masked();` **dưới superuser** (socket).
+    Thủ tục tự từ chối role khác: `db_owner` bị `FORCE RLS` nên đọc `app.*` ra
+    0 dòng — không chặn thì bản sao bị xóa trắng mà không báo lỗi. Đừng biến nó
+    thành `SECURITY DEFINER` rồi cấp cho ai: đó là đường đọc vượt RLS.
+  - Che **tĩnh**, không dùng view che động trên `app`: view chạy dưới quyền chủ
+    sở hữu (`db_owner`, bị FORCE RLS → 0 dòng) và bắt `dev_user` chạm đường dẫn
+    tới bản gốc.
+  - `cccd`, `cccd_hash`, `card_token` giữ cột nhưng có `CHECK (... IS NULL)` —
+    đừng gỡ để "chép cho đủ". `dev.staff` cố ý không có cột đăng nhập.
+  - Thêm cột nhạy cảm vào bảng `app` thì phải quyết định cách che nó trong
+    `dev.refresh_masked()`; `verify.sh` mục "LOP 2b" ghim kết quả che của khách id 2.
+  - Thêm role mới (như `dev_user`) cần đủ 4 chỗ: `02_roles.sh` (+ biến mật
+    khẩu trong `.env.example` và `environment` của service postgres),
+    `04_grants.sql`, dòng `hostssl` trong `pg_hba.conf`. `.env` cũ thiếu biến
+    mới thì `02_roles.sh` dừng ngay khi init.
 
 **Mã hóa (lớp 2) — chỉ dùng ba hàm này, đừng gọi pgcrypto trực tiếp:**
 
@@ -609,6 +627,12 @@ Xem mục 7c trong `README.md`. Phần dễ sai:
   - Container PITR cần secret `backup_key` (khai báo trong compose) — thiếu thì
     `backup-crypt.sh` báo lỗi ngay chứ không im lặng.
 
+- **Đo RTO/RPO: `bash backup/scripts/measure_rto_rpo.sh --yes [--runs N]`**,
+  ghi `docs/rto-rpo-results.md`. Kịch bản A **thật sự** xóa đơn hàng rồi PITR
+  trên database đang chạy, lặp N lần (mỗi lần một timeline mới) — đừng chạy lúc
+  đang demo. Thời điểm dùng để tính khoảng mất dữ liệu phải lấy từ đồng hồ
+  **database** (`clock_timestamp()`), không trộn với đồng hồ host: VM của
+  Docker Desktop có thể lệch. Bảng thăm dò `rpo_probe` bị xóa khi script kết thúc.
 - **Sandbox KHÔNG được promote.** `pitr-sandbox` dừng bằng
   `recovery_target_action=pause`, gắn archive read-only và chạy
   `archive_mode=off`. Promote là sinh file `.history` của một timeline mới
@@ -645,7 +669,7 @@ Sau mỗi thay đổi ở `postgres/`:
 
 ```bash
 bash scripts/reset.sh --yes    # nếu có sửa postgres/init/
-bash scripts/verify.sh         # 157 phép thử, phải đạt hết
+bash scripts/verify.sh         # 170 phép thử, phải đạt hết
 ```
 
 Thêm cơ chế bảo mật mới thì **thêm phép thử tương ứng vào `scripts/verify.sh`**

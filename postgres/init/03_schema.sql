@@ -191,4 +191,78 @@ CREATE TABLE audit.honeytokens (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- -----------------------------------------------------------------------------
+-- LỚP 2 - Bản sao ĐÃ CHE cho môi trường phát triển / kiểm thử (schema `dev`).
+--
+-- Lập trình viên cần dữ liệu "trông như thật" (đủ số dòng, đúng quan hệ, đúng
+-- phân bổ chi nhánh) để viết và thử truy vấn, nhưng không cần biết khách hàng
+-- thật là ai. Bản sao này tách hẳn khỏi `app`: dev_user chỉ có quyền trên
+-- `dev`, không có USAGE trên `app`/`audit`/`ext` (04_grants.sql) - chiếm được
+-- máy của lập trình viên cũng không đọc được bản gốc.
+--
+-- Che TĨNH (sao một lần, đã che sẵn) chứ không phải view che động trên `app`:
+--   - View trên `app` vẫn đọc từ bảng gốc, nên dev_user phải được chạm vào
+--     đường dẫn tới dữ liệu thật; một lỗi trong view là lộ.
+--   - View mặc định chạy dưới quyền chủ sở hữu (db_owner), mà db_owner bị FORCE
+--     RLS chặn - view sẽ trả 0 dòng (cùng bẫy với hàm SECURITY DEFINER).
+--
+-- Cột nhạy cảm GIỮ LẠI để bản sao cùng hình dạng với `app` (code chạy được trên
+-- cả hai), nhưng có CHECK (... IS NULL): kể cả superuser lỡ tay chép nhầm
+-- ciphertext sang thì cũng bị từ chối. Ciphertext dù chưa giải mã được vẫn là
+-- thứ không nên rời khỏi môi trường thật - lộ cùng khóa là lộ hết.
+--
+-- `dev.staff` KHÔNG có username / db_user / password_hash - không có cột thì
+-- không có gì để lộ.
+--
+-- Không bật RLS: dev_user thấy cả ba chi nhánh, vì dữ liệu đã che. Đổ dữ liệu
+-- bằng dev.refresh_masked() (08_dev_mask.sql), chỉ superuser gọi được.
+-- -----------------------------------------------------------------------------
+CREATE TABLE dev.branches (
+    id    INT  PRIMARY KEY,
+    code  TEXT NOT NULL,
+    name  TEXT NOT NULL,
+    city  TEXT
+);
+
+CREATE TABLE dev.staff (
+    id         INT     PRIMARY KEY,
+    branch_id  INT     NOT NULL REFERENCES dev.branches(id),
+    full_name  TEXT    NOT NULL,
+    position   TEXT,
+    is_active  BOOLEAN NOT NULL
+);
+
+CREATE TABLE dev.customers (
+    id          BIGINT      PRIMARY KEY,
+    branch_id   INT         NOT NULL REFERENCES dev.branches(id),
+    full_name   TEXT        NOT NULL,
+    phone       TEXT,
+    email       TEXT,
+    cccd        BYTEA       CONSTRAINT dev_customers_cccd_removed      CHECK (cccd IS NULL),
+    cccd_hash   BYTEA       CONSTRAINT dev_customers_cccd_hash_removed CHECK (cccd_hash IS NULL),
+    created_at  TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE dev.orders (
+    id           BIGINT        PRIMARY KEY,
+    customer_id  BIGINT        NOT NULL REFERENCES dev.customers(id),
+    branch_id    INT           NOT NULL REFERENCES dev.branches(id),
+    order_no     TEXT          NOT NULL,
+    status       TEXT          NOT NULL,
+    total_amount NUMERIC(14,2) NOT NULL,
+    created_at   TIMESTAMPTZ   NOT NULL
+);
+
+CREATE TABLE dev.payments (
+    id          BIGINT        PRIMARY KEY,
+    order_id    BIGINT        NOT NULL REFERENCES dev.orders(id),
+    branch_id   INT           NOT NULL REFERENCES dev.branches(id),
+    method      TEXT          NOT NULL,
+    amount      NUMERIC(14,2) NOT NULL,
+    card_last4  TEXT,
+    card_token  BYTEA         CONSTRAINT dev_payments_card_token_removed CHECK (card_token IS NULL),
+    paid_at     TIMESTAMPTZ   NOT NULL
+);
+
 RESET ROLE;

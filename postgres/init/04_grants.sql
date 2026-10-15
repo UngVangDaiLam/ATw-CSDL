@@ -15,6 +15,7 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 REVOKE ALL    ON SCHEMA app    FROM PUBLIC;
 REVOKE ALL    ON SCHEMA audit  FROM PUBLIC;
 REVOKE ALL    ON SCHEMA ext    FROM PUBLIC;
+REVOKE ALL    ON SCHEMA dev    FROM PUBLIC;
 
 -- Quyền TEMP trên database (mặc định PUBLIC có): tạo bảng/hàm trong pg_temp.
 -- Không role nào của lab cần. Thu hồi vì hàm pg_temp.current_branch_id() tự
@@ -156,6 +157,19 @@ GRANT USAGE  ON SEQUENCE audit.alerts_id_seq TO analyzer_user;
 -- =============================================================================
 GRANT USAGE  ON SCHEMA audit TO dashboard_user;
 GRANT SELECT ON audit.alerts TO dashboard_user;
+
+-- =============================================================================
+-- dev_user  (LỚP 2 - bản sao đã che cho môi trường phát triển)
+--
+-- CHỈ SELECT trên schema `dev`, liệt kê từng bảng (whitelist như mọi chỗ khác).
+-- KHÔNG USAGE trên `app` -> không đọc được bản gốc, không gọi được
+--   app.decrypt_text() hay app.blind_index() (hàm nằm trong schema app).
+-- KHÔNG USAGE trên `audit`, `ext`.
+-- KHÔNG INSERT/UPDATE/DELETE -> bản sao chỉ đổi khi superuser chạy lại
+--   dev.refresh_masked(); kèm default_transaction_read_only ở 02_roles.sh.
+-- =============================================================================
+GRANT USAGE  ON SCHEMA dev TO dev_user;
+GRANT SELECT ON dev.branches, dev.staff, dev.customers, dev.orders, dev.payments TO dev_user;
 
 -- =============================================================================
 -- app.staff_sessions  (token phiên đăng nhập - 03_schema.sql)

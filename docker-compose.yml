@@ -34,6 +34,7 @@ services:
       ADMIN_PASSWORD:    ${ADMIN_PASSWORD}
       ANALYZER_PASSWORD: ${ANALYZER_PASSWORD}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      DEV_PASSWORD:       ${DEV_PASSWORD}
 
     # LỚP 2 - khóa mã hóa.
     # Mount thành file ở /run/secrets/ bên trong container, KHÔNG thành biến

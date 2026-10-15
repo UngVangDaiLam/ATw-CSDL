@@ -48,7 +48,8 @@ analyzer/state/*
 # Ban build giao dien cua app/ (npm run build)
 app/public/
 
-#Thuyet trinh
+#Bao cao
+anh_bao_cao/
 *.pdf
 *.pptx
 *.docx
